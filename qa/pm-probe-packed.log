@@ -1,0 +1,7 @@
+Starting linked engine
+Initializing upstream application
+Startup frame: 1, 1144 x 688, 16 bytes, engine 0 ms, total 176 ms
+Startup frame: 2, 1144 x 688, 16 bytes, engine 0 ms, total 125 ms
+Startup frame: 3, 1144 x 688, 16 bytes, engine 0 ms, total 170 ms
+Engine linear memory: 24 bytes after startup
+Resize frame: 8, 1280 x 751, 16 bytes, engine 0 ms, total 448 ms

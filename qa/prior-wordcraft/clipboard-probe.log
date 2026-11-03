@@ -1,0 +1,18 @@
+PM cp=437 encoded length=16 bytes=57 61 72 70 43 6c 69 70 20 63 61 66 82 20 3f 3f 
+PASS active code-page encode
+PASS active code-page decode
+PASS PM write
+EXIT failures=0
+PASS cross-process Unicode read
+PASS cross-process HTML read
+CF_TEXT region=64 flags=12013
+PASS other app reads CF_TEXT
+PASS other app sets CF_TEXT
+PASS other app sets RTF
+PASS CF_TEXT import
+PASS RTF import
+PASS native format enumeration
+PASS native bitmap output
+PASS native bitmap size
+PASS native bitmap colors and orientation
+EXIT failures=0

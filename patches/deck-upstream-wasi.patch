@@ -1,0 +1,259 @@
+diff --git a/crates/engine/Cargo.toml b/crates/engine/Cargo.toml
+index cb1f4c2..cfc9e38 100644
+--- a/crates/engine/Cargo.toml
++++ b/crates/engine/Cargo.toml
+@@ -31,7 +31,7 @@ chrono = { workspace = true }
+ deckcraft-anim = { workspace = true }
+ zip = { workspace = true }
+ 
+-# The browser clock for comment timestamps (wasm has no std::time::SystemTime).
+-[target.'cfg(target_arch = "wasm32")'.dependencies]
++# The browser clock for comment timestamps on WebAssembly without WASI.
++[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+ js-sys = "0.3"
+ 
+diff --git a/crates/engine/src/cmd/file.rs b/crates/engine/src/cmd/file.rs
+index 8943eb9..727678e 100644
+--- a/crates/engine/src/cmd/file.rs
++++ b/crates/engine/src/cmd/file.rs
+@@ -307,6 +307,15 @@ fn open_bytes(s: &mut Session, p: &Value) -> Result<Value> {
+     Ok(json!({"document": i, "missingFonts": s.doc()?.missing_fonts, "damagedMedia": damaged.media, "lostSlides": damaged.slides}))
+ }
+ 
++/// Read a presentation handed over by a native host that owns its filesystem.
++pub fn open_host_bytes(s: &mut Session, path: &str, data: &[u8]) -> Result<()> {
++    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
++    let (doc, damaged) = open_checked(name, data)?;
++    let native = damaged.is_empty() && (deckcraft_format::sniff(data) || deckcraft_pptx::sniff(data));
++    add_opened(s, name, native.then(|| path.to_owned()), doc);
++    report_damage(s, &damaged)
++}
++
+ /// Tell the user which pictures, media and slides a damaged file lost, and mark the copy repaired.
+ fn report_damage(s: &mut Session, damaged: &Damage) -> Result<()> {
+     if damaged.is_empty() {
+@@ -469,7 +478,7 @@ pub fn format_for_path(path: &str) -> &'static str {
+     }
+ }
+ 
+-fn mark_saved(s: &mut Session, path: Option<String>) -> Result<()> {
++pub fn mark_saved(s: &mut Session, path: Option<String>) -> Result<()> {
+     let st = s.doc_mut()?;
+     st.saved_doc = st.doc.clone();
+     if path.is_some() {
+diff --git a/crates/engine/src/cmd/review.rs b/crates/engine/src/cmd/review.rs
+index 6a18db5..088f59e 100644
+--- a/crates/engine/src/cmd/review.rs
++++ b/crates/engine/src/cmd/review.rs
+@@ -105,13 +105,13 @@ pub fn specs() -> Vec<CommandSpec> {
+     ]
+ }
+ 
+-/// Seconds since the Unix epoch: the system clock, or the browser's on wasm (which has no `SystemTime`).
++/// Seconds since the Unix epoch: the system clock, or the browser's on targets without a system clock.
+ fn now_secs() -> u64 {
+-    #[cfg(not(target_arch = "wasm32"))]
++    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+     {
+         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+     }
+-    #[cfg(target_arch = "wasm32")]
++    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+     {
+         (js_sys::Date::now() / 1000.0).max(0.0) as u64
+     }
+@@ -675,7 +675,7 @@ fn revised_bytes(p: &Value) -> Result<(String, Vec<u8>)> {
+         let bytes = base64_decode(data).ok_or_else(|| bad("review.compare", "invalid base64 `data`"))?;
+         return Ok((str_param(p, "name").unwrap_or("Revised").to_string(), bytes));
+     }
+-    #[cfg(not(target_arch = "wasm32"))]
++    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+     if let Some(path) = str_param(p, "path") {
+         let bytes = crate::io::read_file(path).map_err(crate::EngineError::Other)?;
+         return Ok((path.to_string(), bytes));
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index c6d9f45..9122676 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -274,6 +274,9 @@ impl DocState {
+     pub fn title(&self) -> String {
+         self.path
+             .as_deref()
++            .map(|p| {
++                if cfg!(target_os = "wasi") { p.rsplit(['/', '\\']).next().unwrap_or(p) } else { p }
++            })
+             .and_then(|p| std::path::Path::new(p).file_stem())
+             .map(|n| n.to_string_lossy().to_string())
+             .unwrap_or_else(|| self.title.clone())
+diff --git a/crates/engine/src/recovery.rs b/crates/engine/src/recovery.rs
+index d8c9f23..ba09eac 100644
+--- a/crates/engine/src/recovery.rs
++++ b/crates/engine/src/recovery.rs
+@@ -44,13 +44,12 @@ pub fn instance_id() -> u64 {
+     *ID.get_or_init(|| {
+         use std::hash::{BuildHasher, Hasher};
+         let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+-        // No PIDs and no std::time on wasm (`std::process::id()` and
+-        // `SystemTime::now()` panic there): the browser clock stands in.
+-        #[cfg(target_arch = "wasm32")]
++        // The browser lacks a system clock, and WebAssembly hosts lack a process ID.
++        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+         h.write_u64(js_sys::Date::now() as u64);
+         #[cfg(not(target_arch = "wasm32"))]
+         h.write_u32(std::process::id());
+-        #[cfg(not(target_arch = "wasm32"))]
++        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+         if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+             h.write_u128(d.as_nanos());
+         }
+diff --git a/crates/pdf/src/lib.rs b/crates/pdf/src/lib.rs
+index 6baeda3..15c9ec0 100644
+--- a/crates/pdf/src/lib.rs
++++ b/crates/pdf/src/lib.rs
+@@ -463,7 +463,11 @@ fn fill_clear(front: &mut [u8], back: &[u8]) {
+ }
+ 
+ /// Most bytes of opaque backdrop rasters kept to recognise a backdrop seen before.
++#[cfg(not(target_os = "wasi"))]
+ const BACKDROP_CACHE_BYTES: usize = 32 << 20;
++/// Stay within the native host's linear-memory budget by avoiding a second large raster copy.
++#[cfg(target_os = "wasi")]
++const BACKDROP_CACHE_BYTES: usize = 8 << 20;
+ 
+ /// Backdrops already handed to the writer, most recent first, with their pixels. Slides that
+ /// share a layout render the same backdrop; reusing its image skips hashing and compressing the
+diff --git a/crates/ui-egui/src/app/files.rs b/crates/ui-egui/src/app/files.rs
+index 1e846e0..45e0135 100644
+--- a/crates/ui-egui/src/app/files.rs
++++ b/crates/ui-egui/src/app/files.rs
+@@ -240,6 +240,16 @@ impl SlideApp {
+     /// Hands `bytes` to the browser as a download (web); false (with the reason in the status
+     /// bar) when there are no bytes or no way to download.
+     fn download(&mut self, name: &str, bytes: deckcraft_engine::Result<Vec<u8>>) -> bool {
++        if let Some(save) = self.services.host_save.as_mut() {
++            let result = bytes.map_err(|e| e.to_string()).and_then(|bytes| save(name, &bytes, true));
++            return match result {
++                Ok(path) => path.is_some(),
++                Err(error) => {
++                    self.set_status(error);
++                    false
++                }
++            };
++        }
+         match (bytes, self.services.download.as_mut()) {
+             (Ok(b), Some(dl)) => {
+                 dl(name, &b);
+@@ -451,7 +461,9 @@ impl SlideApp {
+         let name = self.session.active().map(|d| d.title()).unwrap_or_else(|| "Presentation".into());
+         let ext = if format == "pptx" { "pptx" } else { "deckcraft" };
+         let suggested = format!("{name}.{ext}");
+-        if let Some(pick) = self.services.pick_save.as_mut() {
++        if self.services.host_save.is_some() {
++            self.host_save_document(&suggested, ext, true);
++        } else if let Some(pick) = self.services.pick_save.as_mut() {
+             if let Some(path) = pick(&suggested) {
+                 match self.session.execute("file.saveAs", &json!({"path": path})) {
+                     Ok(_) => {
+@@ -486,8 +498,27 @@ impl SlideApp {
+         true
+     }
+ 
++    fn host_save_document(&mut self, name: &str, format: &str, save_as: bool) {
++        use deckcraft_engine::cmd::file::{mark_saved, save_bytes};
++        let (Some(save), Some(doc)) = (self.services.host_save.as_mut(), self.session.active()) else { return };
++        let result = save_bytes(&doc.doc, format).map_err(|e| e.to_string()).and_then(|bytes| save(name, &bytes, save_as));
++        match result {
++            Ok(Some(path)) => match mark_saved(&mut self.session, Some(path)) {
++                Ok(()) => self.set_status("Saved"),
++                Err(e) => self.set_status(e.to_string()),
++            },
++            Ok(None) => {}
++            Err(error) => self.set_status(error),
++        }
++    }
++
+     pub fn save(&mut self) {
+-        if self.session.active().and_then(|d| d.path.clone()).is_some() {
++        if let Some(path) = self.session.active().and_then(|d| d.path.clone()) {
++            if self.services.host_save.is_some() {
++                let format = deckcraft_engine::cmd::file::format_for_path(&path);
++                self.host_save_document(&path, format, false);
++                return;
++            }
+             match self.session.execute("file.save", &json!({})) {
+                 Ok(_) => self.set_status("Saved"),
+                 Err(e) => self.set_status(e.to_string()),
+@@ -611,6 +642,13 @@ impl SlideApp {
+                 return;
+             }
+         };
++        if cmd == "file.openBytes" && self.services.host_save.is_some() {
++            if let Err(error) = deckcraft_engine::cmd::file::open_host_bytes(&mut self.session, name, bytes) {
++                self.notify(error.to_string());
++            }
++            self.drain_requests();
++            return;
++        }
+         let params = if cmd == "slide.fromOutline" {
+             json!({"text": deckcraft_engine::cmd::file::outline_text(bytes), "markdown": name.to_ascii_lowercase().ends_with(".md")})
+         } else {
+diff --git a/crates/ui-egui/src/backstage/info.rs b/crates/ui-egui/src/backstage/info.rs
+index 0dce747..bfef25d 100644
+--- a/crates/ui-egui/src/backstage/info.rs
++++ b/crates/ui-egui/src/backstage/info.rs
+@@ -166,15 +166,15 @@ pub(super) fn save_as(app: &mut SlideApp, ui: &mut Ui, bs: &mut Backstage, out:
+             })
+             .response
+             .widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Save as type"));
+-        let web = app.services.pick_save.is_none();
++        let web = app.services.pick_save.is_none() && app.services.host_save.is_none();
+         let label = if web { "Download" } else { "Save" };
+         let save = ui.add(egui::Button::new(RichText::new(label).color(t.accent_text)).fill(t.accent).min_size(vec2(84.0, 26.0)));
+         if save.on_hover_text(if web { "Download the file" } else { "Choose where to save" }).clicked() {
+             let fmt = bs.file_type;
+             let done = if matches!(fmt, "pptx" | "deckcraft") {
+-                let before = app.session.active().map(|d| (d.path.clone(), d.is_dirty()));
++                let before = app.session.active().map(|d| d.revision);
+                 app.save_as_dialog(fmt);
+-                web || app.session.active().map(|d| (d.path.clone(), d.is_dirty())) != before
++                web || app.session.active().map(|d| d.revision) != before
+             } else {
+                 app.export_as(fmt, json!({}))
+             };
+diff --git a/crates/ui-egui/src/backstage/print.rs b/crates/ui-egui/src/backstage/print.rs
+index 612ecaf..6dc5114 100644
+--- a/crates/ui-egui/src/backstage/print.rs
++++ b/crates/ui-egui/src/backstage/print.rs
+@@ -83,7 +83,9 @@ pub(super) fn print(app: &mut SlideApp, ui: &mut Ui, bs: &mut Backstage) {
+             ui.add_space(6.0);
+             dim(
+                 ui,
+-                if app.services.pick_save.is_some() {
++                if app.services.host_save.is_some() {
++                    "Choose where to save the PDF. Open it in a PDF viewer to print."
++                } else if app.services.pick_save.is_some() {
+                     "DeckCraft prints through a PDF: it opens in your PDF viewer, where you choose the printer."
+                 } else {
+                     "DeckCraft prints through a PDF: it downloads, ready to print from your browser or PDF viewer."
+diff --git a/crates/ui-egui/src/services.rs b/crates/ui-egui/src/services.rs
+index fc8eb5d..85f87c4 100644
+--- a/crates/ui-egui/src/services.rs
++++ b/crates/ui-egui/src/services.rs
+@@ -11,6 +11,9 @@ pub type OpenAsyncFn = Box<dyn FnMut(&str, u64)>;
+ 
+ pub type DownloadFn = Box<dyn FnMut(&str, &[u8])>;
+ 
++/// Save serialized bytes on the host. Returns the written path, or no path on cancellation.
++pub type HostSaveFn = Box<dyn FnMut(&str, &[u8], bool) -> Result<Option<String>, String>>;
++
+ /// A file the host finished reading for the request `id` from [`SlideApp::begin_external_file`].
+ #[derive(Clone, Debug)]
+ pub struct InboxFile {
+@@ -49,6 +52,7 @@ pub struct Services {
+     pub open_async: Option<OpenAsyncFn>,
+     /// Hand bytes to the user as a named file (browser download).
+     pub download: Option<DownloadFn>,
++    pub host_save: Option<HostSaveFn>,
+     pub inbox: Option<Inbox>,
+     /// Image on the system clipboard (PNG bytes), when the host can read one.
+     pub clipboard_image: Option<Box<dyn FnMut() -> Option<Vec<u8>>>>,

@@ -1,0 +1,71 @@
+diff --git a/crates/i18n/Cargo.toml b/crates/i18n/Cargo.toml
+index dbe1464..c8e3d34 100644
+--- a/crates/i18n/Cargo.toml
++++ b/crates/i18n/Cargo.toml
+@@ -27,7 +27,7 @@ icu_properties = "~2.3"
+ icu_collator = { version = "~2.3.1", default-features = false, features = ["serde"], optional = true }
+ unicode-bidi = "0.3"
+ 
+-[target.'cfg(target_arch = "wasm32")'.dependencies]
++[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+ sys-locale = { version = "0.3", features = ["js"] }
+ 
+ # The regional format (Region::system); safe registry reads, MIT OR Apache-2.0.
+diff --git a/crates/ui/Cargo.toml b/crates/ui/Cargo.toml
+index e7df43f..56846e2 100644
+--- a/crates/ui/Cargo.toml
++++ b/crates/ui/Cargo.toml
+@@ -28,7 +28,7 @@ fontique = { version = "0.11.1", default-features = false, features = ["system",
+ unicode-script = { version = "0.5.8", optional = true }
+ 
+ # Fetching served fonts (`fonts::UiFonts::served_faces`); already in every eframe web build.
+-[target.'cfg(target_arch = "wasm32")'.dependencies]
++[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+ js-sys = "0.3"
+ wasm-bindgen = "0.2"
+ wasm-bindgen-futures = "0.4"
+diff --git a/crates/ui/src/fonts/mod.rs b/crates/ui/src/fonts/mod.rs
+index 436f773..bad7961 100644
+--- a/crates/ui/src/fonts/mod.rs
++++ b/crates/ui/src/fonts/mod.rs
+@@ -774,7 +774,7 @@ impl Stack {
+     /// On the web, a stack with [`UiFonts::served_faces`] also fetches them (see there); the faces
+     /// already fetched for an earlier stack are added at once.
+     pub fn install(&self, ctx: &egui::Context) {
+-        #[cfg(target_arch = "wasm32")]
++        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+         if !self.served.is_empty() {
+             return served::web::install(ctx, self.clone());
+         }
+diff --git a/crates/ui/src/fonts/served.rs b/crates/ui/src/fonts/served.rs
+index d1cbcd4..25706a7 100644
+--- a/crates/ui/src/fonts/served.rs
++++ b/crates/ui/src/fonts/served.rs
+@@ -8,9 +8,9 @@ use egui::epaint::text::Blob;
+ 
+ use super::{CjkRows, CraftFace, EM_SQUARE_SCRIPTS, Stack, baseline_fallback, set_weight};
+ 
+-#[cfg(any(test, target_arch = "wasm32"))]
++#[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
+ pub(super) mod loader;
+-#[cfg(target_arch = "wasm32")]
++#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+ pub(super) mod web;
+ 
+ /// The script tag served emoji faces get: ISO 15924 `Zsye`, emoji.
+@@ -168,13 +168,13 @@ impl Stack {
+ /// Whether the UI language's served faces are still being fetched, for an app that waits for them
+ /// before drawing its interface. Always false outside the web, and once every fetch has finished,
+ /// failed ones included.
+-#[cfg(target_arch = "wasm32")]
++#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+ pub fn loading(ctx: &egui::Context) -> bool {
+     web::loading(ctx)
+ }
+ 
+ /// Whether the UI language's served faces are still being fetched: never, outside the web.
+-#[cfg(not(target_arch = "wasm32"))]
++#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+ pub fn loading(_ctx: &egui::Context) -> bool {
+     false
+ }

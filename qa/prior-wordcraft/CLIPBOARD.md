@@ -1,0 +1,8 @@
+# Clipboard on Warp 4.52
+
+These results are from the earlier standalone WordCraft build.
+The editor uses the Presentation Manager clipboard for text, formatted HTML, RTF import, and pictures. Ctrl+C, Ctrl+X, Ctrl+V, Ctrl+Insert, Shift+Delete, and Shift+Insert use the same clipboard as the ribbon. WordCraft publishes native `CF_TEXT` in the active Presentation Manager code page and Unicode and HTML in the OS/2 Mozilla clipboard formats. An equation copied by itself can also publish MathML. Bitmap clipboard transfers use the system's `CF_BITMAP` format.
+
+The [native clipboard probe](clipboard-probe.c) links the same host object as WordCraft. Its first process wrote formatted text containing `café` and a supplementary Unicode character. After that process exited, a second process read both Unicode and HTML from the clipboard and read `café` directly through the OS/2 `CF_TEXT` API. The second process published independent `CF_TEXT` and RTF entries and then checked that the port imported them, listed the formats, and preserved bitmap colors and orientation through a 2×2 image round trip. Both processes reported zero failures in the [Warp guest log](clipboard-probe.log). The guest's Presentation Manager code page was 437.
+
+To reproduce with OpenWatcom, compile `host/clipboard.c` and `qa/clipboard-probe.c` using `-bt=os2 -3s -zp4 -zastd=c99` and the `host` include path. Link both objects with `system os2v2_pm` and `library os2386` as `CLIPQA.EXE`. In a Warp command window, run `START /PM A:\CLIPQA.EXE W`, then `START /PM A:\CLIPQA.EXE R` after the first exits. Read `A:\CLIPTEST.LOG` on the writable test floppy.

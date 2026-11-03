@@ -1,0 +1,12 @@
+--- a/elf2cof.cpp
++++ b/elf2cof.cpp
+@@ -228,7 +228,8 @@
+                   uint32_t InlinePosition = (uint32_t)(NewHeader.PRawData - RawDataOffset + OldRelocation.r_offset);
+ 
+                   // Check that address is valid
+-                  if (InlinePosition >= this->GetDataSize()) {
++                  if (uint64_t(OldRelocation.r_offset) > uint64_t(OldHeader.sh_size) ||
++                      uint64_t(OldHeader.sh_size) - uint64_t(OldRelocation.r_offset) < sizeof(int32_t)) {
+                      // Address is invalid
+                      err.submit(2032);
+                      break;

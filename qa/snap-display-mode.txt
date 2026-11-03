@@ -1,0 +1,10 @@
+desktop_width=1280
+desktop_height=800
+width=1280
+height=800
+color_planes=1
+bits_per_plane=32
+colors=16777216
+physical_colors=16777216
+bits_per_pixel=32
+status=ok

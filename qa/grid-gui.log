@@ -1,0 +1,35 @@
+Starting linked engine
+Initializing upstream application
+Startup frame: 1, 1144 x 688, 262180 bytes, engine 1092 ms, total 1205 ms
+Startup frame: 2, 1144 x 688, 686172 bytes, engine 15717 ms, total 17068 ms
+Startup frame: 3, 1144 x 688, 425632 bytes, engine 2047 ms, total 3365 ms
+Engine linear memory: 7929856 bytes after startup
+Resize frame: 5, 1280 x 751, 442868 bytes, engine 1315 ms, total 2684 ms
+Slow frame: 9, 1280 x 751, 972340 bytes, engine 16994 ms, total 19789 ms
+Slow frame: 10, 1280 x 751, 447136 bytes, engine 2305 ms, total 4877 ms
+Slow frame: 11, 1280 x 751, 534716 bytes, engine 16252 ms, total 18930 ms
+Slow frame: 12, 1280 x 751, 455504 bytes, engine 3139 ms, total 5865 ms
+Slow frame: 13, 1280 x 751, 1399372 bytes, engine 10412 ms, total 12639 ms
+Slow frame: 17, 1280 x 751, 350904 bytes, engine 2498 ms, total 4207 ms
+Slow frame: 19, 1280 x 751, 309952 bytes, engine 2619 ms, total 3514 ms
+Slow frame: 24, 1280 x 751, 283568 bytes, engine 2109 ms, total 3916 ms
+Slow frame: 27, 1280 x 751, 282828 bytes, engine 2357 ms, total 4629 ms
+Slow frame: 28, 1280 x 751, 281484 bytes, engine 2053 ms, total 4643 ms
+Slow frame: 45, 1280 x 751, 282980 bytes, engine 2242 ms, total 4358 ms
+Slow frame: 46, 1280 x 751, 282876 bytes, engine 2805 ms, total 4694 ms
+Slow frame: 52, 1280 x 751, 285152 bytes, engine 2059 ms, total 4215 ms
+Slow frame: 53, 1280 x 751, 292592 bytes, engine 2014 ms, total 4434 ms
+Slow frame: 54, 1280 x 751, 292592 bytes, engine 2101 ms, total 4476 ms
+Slow frame: 59, 1280 x 751, 281380 bytes, engine 3024 ms, total 5565 ms
+Slow frame: 60, 1280 x 751, 281380 bytes, engine 2426 ms, total 5245 ms
+Slow frame: 61, 1280 x 751, 281380 bytes, engine 2917 ms, total 5224 ms
+Slow frame: 62, 1280 x 751, 281380 bytes, engine 2068 ms, total 4584 ms
+Slow frame: 66, 1280 x 751, 282992 bytes, engine 2092 ms, total 3416 ms
+Slow frame: 69, 1280 x 751, 281380 bytes, engine 2599 ms, total 5072 ms
+Slow frame: 70, 1280 x 751, 224240 bytes, engine 4463 ms, total 6887 ms
+Slow frame: 81, 1280 x 751, 345680 bytes, engine 2067 ms, total 3989 ms
+Slow frame: 82, 1280 x 751, 358052 bytes, engine 2447 ms, total 4191 ms
+Slow frame: 85, 1280 x 751, 355752 bytes, engine 2027 ms, total 3650 ms
+Slow frame: 86, 1280 x 751, 355192 bytes, engine 2222 ms, total 3736 ms
+Slow frame: 90, 1280 x 751, 355752 bytes, engine 2086 ms, total 3625 ms
+Slow frame: 94, 1280 x 751, 353976 bytes, engine 2256 ms, total 4160 ms

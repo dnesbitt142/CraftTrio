@@ -1,0 +1,1264 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 20dcf28..04aa314 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -910,12 +910,10 @@ dependencies = [
+ [[package]]
+ name = "craft-fonts-build"
+ version = "0.1.0"
+-source = "git+https://github.com/storytold/craft-libs?rev=c5a1cbfb5f9049f9270955caffb5bee5997aebf7#c5a1cbfb5f9049f9270955caffb5bee5997aebf7"
+ 
+ [[package]]
+ name = "craft-i18n"
+ version = "0.1.0"
+-source = "git+https://github.com/storytold/craft-libs?rev=c5a1cbfb5f9049f9270955caffb5bee5997aebf7#c5a1cbfb5f9049f9270955caffb5bee5997aebf7"
+ dependencies = [
+  "fixed_decimal",
+  "icu_decimal",
+@@ -952,7 +950,6 @@ dependencies = [
+ [[package]]
+ name = "craft-ui"
+ version = "0.1.0"
+-source = "git+https://github.com/storytold/craft-libs?rev=c5a1cbfb5f9049f9270955caffb5bee5997aebf7#c5a1cbfb5f9049f9270955caffb5bee5997aebf7"
+ dependencies = [
+  "craft-fonts-build",
+  "craft-i18n",
+@@ -2148,6 +2145,16 @@ dependencies = [
+  "zbus",
+ ]
+ 
++[[package]]
++name = "gridcraft-warp"
++version = "0.16.0"
++dependencies = [
++ "egui",
++ "gridcraft-engine",
++ "gridcraft-ui-egui",
++ "serde_json",
++]
++
+ [[package]]
+ name = "gridcraft-web"
+ version = "0.16.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index 594b292..39861f5 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -114,3 +114,7 @@ eframe = { git = "https://github.com/storytold/egui.git", rev = "6d518fc79968157
+ egui_demo_lib = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+ egui_inspection = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+ winit = { git = "https://github.com/storytold/winit.git", rev = "a517b3846ee8457d84ee4975110bfda6797c44dc" }
++
++[patch."https://github.com/storytold/craft-libs"]
++craft-ui = { path = "../grid-craft-libs/crates/ui" }
++craft-i18n = { path = "../grid-craft-libs/crates/i18n" }
+diff --git a/apps/gridcraft-warp/Cargo.toml b/apps/gridcraft-warp/Cargo.toml
+new file mode 100644
+index 0000000..85d9af3
+--- /dev/null
++++ b/apps/gridcraft-warp/Cargo.toml
+@@ -0,0 +1,17 @@
++[package]
++name = "gridcraft-warp"
++version.workspace = true
++edition.workspace = true
++rust-version.workspace = true
++license.workspace = true
++publish = false
++description = "GridCraft Presentation Manager bridge for OS/2"
++
++[lib]
++crate-type = ["cdylib"]
++
++[dependencies]
++gridcraft-engine = { workspace = true }
++gridcraft-ui-egui = { path = "../../crates/ui-egui" }
++egui = { workspace = true }
++serde_json = { workspace = true }
+diff --git a/apps/gridcraft-warp/src/a11y.rs b/apps/gridcraft-warp/src/a11y.rs
+new file mode 100644
+index 0000000..d05f7d1
+--- /dev/null
++++ b/apps/gridcraft-warp/src/a11y.rs
+@@ -0,0 +1,207 @@
++//! Project GridCraft's AccessKit tree onto standard Presentation Manager controls.
++
++use egui::accesskit::{Action, ActionRequest, Node, NodeId, Role, Toggled, TreeId, TreeUpdate};
++use std::collections::{HashMap, HashSet};
++
++pub(crate) const SET_ENABLED: i32 = 20;
++pub(crate) const ACTIVATE: i32 = 21;
++
++const MAX_ROWS: usize = 7000;
++const MAX_PACKET: usize = 2 << 20;
++const MAX_VALUE: usize = 32 << 10;
++const MAX_DEPTH: usize = 64;
++const CLICK: u32 = 1;
++const FOCUS: u32 = 2;
++const DISABLED: u32 = 4;
++const FOCUSED: u32 = 8;
++const DOCUMENT: u32 = 16;
++
++#[derive(Default)]
++pub(crate) struct Accessibility {
++    pub(crate) enabled: bool,
++    pub(crate) packet: Vec<u8>,
++    actions: HashMap<NodeId, Action>,
++}
++
++impl Accessibility {
++    pub(crate) fn set_enabled(&mut self, context: &egui::Context, enabled: bool) {
++        self.enabled = enabled;
++        if enabled {
++            context.enable_accesskit();
++        } else {
++            context.disable_accesskit();
++            self.packet.clear();
++            self.actions.clear();
++        }
++        context.request_repaint();
++    }
++
++    pub(crate) fn action(&self, low: u32, high: u32) -> Option<egui::Event> {
++        let target_node = NodeId(u64::from(low) | (u64::from(high) << 32));
++        Some(egui::Event::AccessKitActionRequest(ActionRequest {
++            action: *self.actions.get(&target_node)?,
++            target_tree: TreeId::ROOT,
++            target_node,
++            data: None,
++        }))
++    }
++
++    pub(crate) fn capture(&mut self, update: TreeUpdate, pixels_per_point: f32) {
++        self.packet.clear();
++        self.actions.clear();
++        if !self.enabled {
++            return;
++        }
++        let Some(tree) = update.tree else { return };
++        // egui publishes a complete snapshot each pass, including the root.
++        let nodes: HashMap<NodeId, Node> = update.nodes.into_iter().collect();
++        let caret = nodes
++            .get(&update.focus)
++            .filter(|node| node.role() == Role::Document)
++            .and_then(|node| node.text_selection())
++            .and_then(|selection| {
++                let position = selection.focus;
++                let run = nodes.get(&position.node)?;
++                let bounds = run.bounds()?;
++                let x = run.character_positions()?.get(position.character_index).map_or(bounds.x1, |offset| bounds.x0 + f64::from(*offset));
++                let h = bounds.height();
++                let scale = f64::from(pixels_per_point);
++                (x.is_finite() && bounds.y0.is_finite() && h.is_finite() && h > 0.0)
++                    .then(|| [(x * scale) as i32, (bounds.y0 * scale) as i32, (h * scale).ceil() as i32])
++            })
++            .unwrap_or([0; 3]);
++        self.packet.extend_from_slice(b"WCA1");
++        for coord in caret {
++            self.packet.extend_from_slice(&coord.to_le_bytes());
++        }
++        let mut pending = vec![(tree.root, 0usize)];
++        let mut seen = HashSet::new();
++        let mut rows = 0;
++        while let Some((id, depth)) = pending.pop() {
++            if depth > MAX_DEPTH || !seen.insert(id) || rows >= MAX_ROWS {
++                continue;
++            }
++            let Some(node) = nodes.get(&id).filter(|node| !node.is_hidden()) else { continue };
++            let role = node.role();
++            let name = node.label().unwrap_or("");
++            let value = if role == Role::PasswordInput { "" } else { node.value().unwrap_or("") };
++            let describe =
++                !name.is_empty() || !value.is_empty() || !matches!(role, Role::Unknown | Role::GenericContainer | Role::Window | Role::Group);
++            if depth < MAX_DEPTH {
++                pending.extend(node.children().iter().rev().map(|child| (*child, depth + usize::from(describe))));
++            }
++            if !describe {
++                continue;
++            }
++            let mut flags = 0;
++            if node.is_disabled() {
++                flags |= DISABLED;
++            } else if node.supports_action(Action::Click) {
++                flags |= CLICK;
++                self.actions.insert(id, Action::Click);
++            } else if node.supports_action(Action::Focus) {
++                flags |= FOCUS;
++                self.actions.insert(id, Action::Focus);
++            }
++            if id == update.focus {
++                flags |= FOCUSED;
++            }
++            let role_name = match role {
++                Role::TextRun | Role::Label => String::new(),
++                Role::Heading => format!("Heading {}", node.level().unwrap_or(1)),
++                Role::ListItem => "List item".into(),
++                Role::TextInput | Role::MultilineTextInput => "Text field".into(),
++                Role::CheckBox => "Check box".into(),
++                Role::ComboBox | Role::EditableComboBox => "Combo box".into(),
++                Role::MenuItem => "Menu item".into(),
++                Role::PasswordInput => "Password field".into(),
++                _ => format!("{role:?}"),
++            };
++            let mut label = role_name;
++            let summary = if name.is_empty() { value } else { name };
++            if !label.is_empty() && !summary.is_empty() {
++                label.push_str(" - ");
++            }
++            label.extend(summary.chars().take(220).map(|ch| if ch.is_control() { ' ' } else { ch }));
++            if label.trim().is_empty() {
++                continue;
++            }
++            match node.toggled() {
++                Some(Toggled::True) => label.push_str(" (checked)"),
++                Some(Toggled::False) => label.push_str(" (unchecked)"),
++                Some(Toggled::Mixed) => label.push_str(" (mixed)"),
++                None => {}
++            }
++            if node.is_selected() == Some(true) {
++                label.push_str(" (selected)");
++            }
++            match node.is_expanded() {
++                Some(true) => label.push_str(" (expanded)"),
++                Some(false) => label.push_str(" (collapsed)"),
++                None => {}
++            }
++            let mut detail = String::new();
++            if role == Role::Document {
++                flags |= DOCUMENT;
++                document_text(&mut detail, node, &nodes);
++            } else {
++                append_value(&mut detail, value);
++                if let Some(description) = node.description().filter(|description| !description.is_empty()) {
++                    if !detail.is_empty() {
++                        append_value(&mut detail, "\n");
++                    }
++                    append_value(&mut detail, description);
++                }
++            }
++            if self.packet.len() + 24 + label.len() + detail.len() > MAX_PACKET {
++                break;
++            }
++            self.packet.extend_from_slice(&id.0.to_le_bytes());
++            for word in [flags, depth as u32, label.len() as u32, detail.len() as u32] {
++                self.packet.extend_from_slice(&word.to_le_bytes());
++            }
++            self.packet.extend_from_slice(label.as_bytes());
++            self.packet.extend_from_slice(detail.as_bytes());
++            rows += 1;
++        }
++    }
++}
++
++fn append_value(out: &mut String, value: &str) {
++    let mut end = value.len().min(MAX_VALUE.saturating_sub(out.len()));
++    while !value.is_char_boundary(end) {
++        end -= 1;
++    }
++    out.push_str(value.get(..end).unwrap_or_default());
++}
++
++fn document_text(out: &mut String, root: &Node, nodes: &HashMap<NodeId, Node>) {
++    let mut pending: Vec<_> = root.children().iter().rev().copied().collect();
++    let mut seen = HashSet::new();
++    while let Some(id) = pending.pop() {
++        if out.len() >= MAX_VALUE || seen.len() >= MAX_ROWS {
++            break;
++        }
++        if !seen.insert(id) {
++            continue;
++        }
++        let Some(node) = nodes.get(&id).filter(|node| !node.is_hidden()) else { continue };
++        match node.role() {
++            Role::TextRun => append_value(out, node.value().unwrap_or("")),
++            Role::ListMarker => {
++                append_value(out, node.value().unwrap_or(""));
++                append_value(out, " ");
++            }
++            Role::Image => {
++                append_value(out, "[Image");
++                if let Some(label) = node.label() {
++                    append_value(out, " - ");
++                    append_value(out, label);
++                }
++                append_value(out, "]");
++            }
++            _ => {}
++        }
++        pending.extend(node.children().iter().rev().copied());
++    }
++}
+diff --git a/apps/gridcraft-warp/src/clipboard.rs b/apps/gridcraft-warp/src/clipboard.rs
+new file mode 100644
+index 0000000..e9375a6
+--- /dev/null
++++ b/apps/gridcraft-warp/src/clipboard.rs
+@@ -0,0 +1,109 @@
++//! Presentation Manager clipboard integration for the upstream editor and egui widgets.
++use egui::{Event, Key, Modifiers, OutputCommand};
++use gridcraft_ui_egui::Services;
++
++const TEXT: u32 = 1;
++const HTML: u32 = 2;
++const MAX_TEXT: usize = 16 << 20;
++const MAX_PICTURE: usize = 64 << 20;
++
++#[link(wasm_import_module = "wc_host")]
++unsafe extern "C" {
++    fn clipboard_read(format: u32, bytes: *mut u8, capacity: usize) -> u32;
++    fn clipboard_write(text: *const u8, text_len: usize, html: *const u8, html_len: usize, math: *const u8, math_len: usize) -> u32;
++    fn clipboard_image(bytes: *const u8, width: usize, height: usize) -> u32;
++}
++
++fn bytes(format: u32, limit: usize) -> Option<Vec<u8>> {
++    // The clipboard may change between the size query and the copy. The host bounds the write.
++    let size = unsafe { clipboard_read(format, std::ptr::null_mut(), 0) } as usize;
++    if size == 0 || size > limit {
++        return None;
++    }
++    let mut out = Vec::new();
++    out.try_reserve_exact(size).ok()?;
++    out.resize(size, 0);
++    let written = unsafe { clipboard_read(format, out.as_mut_ptr(), out.len()) } as usize;
++    if written > out.len() {
++        return None;
++    }
++    out.truncate(written);
++    Some(out)
++}
++
++fn text() -> Option<String> {
++    Some(String::from_utf8(bytes(TEXT, MAX_TEXT)?).ok()?.replace("\r\n", "\n"))
++}
++
++fn html() -> Option<String> {
++    String::from_utf8(bytes(HTML, MAX_TEXT)?).ok()
++}
++
++fn put(html: &str, text: &str, mathml: &str) -> bool {
++    unsafe { clipboard_write(text.as_ptr(), text.len(), html.as_ptr(), html.len(), mathml.as_ptr(), mathml.len()) != 0 }
++}
++
++pub(crate) fn install(services: &mut Services) {
++    services.paste_text = Some(Box::new(text));
++    services.paste_html = Some(Box::new(html));
++    services.copy_html = Some(Box::new(|html, text| put(html, text, "").then_some(()).ok_or_else(|| "Could not copy to the OS/2 clipboard".into())));
++}
++
++pub(crate) fn key_event(events: &mut Vec<Event>, key: Key, pressed: bool, repeat: bool, modifiers: Modifiers) {
++    let control = modifiers.command_only();
++    let shift = modifiers.shift && !modifiers.ctrl && !modifiers.alt;
++    if pressed {
++        match key {
++            Key::C | Key::Insert if control => {
++                events.push(Event::Copy);
++                return;
++            }
++            Key::X if control => {
++                events.push(Event::Cut);
++                return;
++            }
++            Key::Delete if shift => {
++                events.push(Event::Cut);
++                return;
++            }
++            _ => {}
++        }
++    }
++    if pressed && (key == Key::Insert && shift || key == Key::V && control) {
++        if let Some(contents) = text() {
++            events.push(Event::Paste(contents));
++        }
++        if key == Key::Insert {
++            // The native Shift+Insert chord is a Paste key even if Shift is released first.
++            events.push(Event::Key { key: Key::Paste, physical_key: None, pressed: false, repeat, modifiers: Modifiers::NONE });
++        }
++        // Like egui-winit, suppress the Ctrl+V press. Its later release can paste a
++        // picture with no text even when the Ctrl key comes up first.
++        return;
++    }
++    // Retain other key events for shortcuts such as Ctrl+Alt+V (Paste Special).
++    events.push(Event::Key { key, physical_key: None, pressed, repeat, modifiers });
++}
++
++pub(crate) fn output(commands: &[OutputCommand]) {
++    for command in commands {
++        match command {
++            OutputCommand::CopyText(text) => {
++                put("", text, "");
++            }
++            OutputCommand::CopyImage(image) => {
++                let Some(size) = image.pixels.len().checked_mul(4).filter(|&n| n <= MAX_PICTURE) else { continue };
++                let mut rgba = Vec::new();
++                if rgba.try_reserve_exact(size).is_err() {
++                    continue;
++                }
++                for pixel in &image.pixels {
++                    rgba.extend_from_slice(&pixel.to_srgba_unmultiplied());
++                }
++                unsafe { clipboard_image(rgba.as_ptr(), image.width(), image.height()) };
++            }
++            OutputCommand::OpenUrl(url) => crate::file_bridge::open_url(&url.url),
++            OutputCommand::TextSelectionSettled(_) => {}
++        }
++    }
++}
+diff --git a/apps/gridcraft-warp/src/file_bridge.rs b/apps/gridcraft-warp/src/file_bridge.rs
+new file mode 100644
+index 0000000..eee5a6a
+--- /dev/null
++++ b/apps/gridcraft-warp/src/file_bridge.rs
+@@ -0,0 +1,110 @@
++//! File selection and byte delivery for the Presentation Manager host.
++use gridcraft_ui_egui::{Inbox, Services};
++use std::cell::{Cell, RefCell};
++use std::rc::Rc;
++
++const MAX_PATH_BYTES: usize = 1024;
++const MAX_INPUT_BYTES: usize = 16 << 20;
++
++#[link(wasm_import_module = "wc_host")]
++unsafe extern "C" {
++    #[link_name = "open_url_native"]
++    fn native_open_url(url: *const u8, url_len: usize);
++    #[link_name = "save"]
++    fn native_save(name: *const u8, name_len: usize, data: *const u8, data_len: usize, save_as: i32, path: *mut u8, path_cap: usize) -> i32;
++}
++
++pub(crate) fn open_url(url: &str) {
++    // The host reads the live UTF-8 URL for this synchronous call.
++    unsafe { native_open_url(url.as_ptr(), url.len()) };
++}
++
++fn save(name: &str, data: &[u8], save_as: bool) -> Result<Option<String>, String> {
++    let mut path = [0u8; MAX_PATH_BYTES];
++    // The strings and byte slices stay live for the synchronous host call. The host validates
++    // offsets in the module's linear memory and writes at most `path.len()` bytes to `path`.
++    let result = unsafe { native_save(name.as_ptr(), name.len(), data.as_ptr(), data.len(), i32::from(save_as), path.as_mut_ptr(), path.len()) };
++    match result {
++        -1 => Ok(None),
++        0 => Ok(Some(name.to_owned())),
++        n if n > 0 => {
++            let name = path.get(..n as usize).ok_or("The OS/2 path is too long")?;
++            let name = std::str::from_utf8(name).map_err(|_| "The OS/2 path is not valid UTF-8")?;
++            if name.contains('\0') {
++                return Err("The OS/2 path contains a zero byte".into());
++            }
++            Ok(Some(name.to_owned()))
++        }
++        _ => Err("OS/2 could not save the workbook".into()),
++    }
++}
++
++#[derive(Default)]
++pub(crate) struct Files {
++    request: Rc<Cell<i32>>,
++    inbox: Inbox,
++    picture: Rc<RefCell<Option<Inbox>>>,
++    input: Vec<u8>,
++}
++
++impl Files {
++    pub(crate) fn services(&self) -> Services {
++        let request = self.request.clone();
++        let picture_request = self.request.clone();
++        let picture = self.picture.clone();
++        Services {
++            open_async: Some(Box::new(move || request.set(1))),
++            pick_picture_async: Some(Box::new(move |inbox| {
++                picture.replace(Some(inbox));
++                picture_request.set(2);
++            })),
++            inbox: Some(self.inbox.clone()),
++            open_url: Some(Box::new(open_url)),
++            host_save: Some(Box::new(save)),
++            download: Some(Box::new(|name, bytes| {
++                if let Err(e) = save(name, bytes, true) {
++                    eprintln!("{e}");
++                }
++            })),
++            ..Services::default()
++        }
++    }
++
++    pub(crate) fn take_request(&self) -> i32 {
++        self.request.replace(0)
++    }
++
++    pub(crate) fn reserve_input(&mut self, len: usize) -> Option<usize> {
++        if len == 0 || len > MAX_INPUT_BYTES + MAX_PATH_BYTES {
++            return None;
++        }
++        self.input.clear();
++        self.input.try_reserve_exact(len).ok()?;
++        self.input.resize(len, 0);
++        Some(self.input.as_mut_ptr() as usize)
++    }
++
++    pub(crate) fn accept_input(&mut self, name_len: usize, data_len: usize) -> Option<()> {
++        let picture = self.picture.take();
++        if name_len == 0 && data_len == 0 {
++            self.input.clear();
++            return Some(());
++        }
++        if name_len == 0 || name_len > MAX_PATH_BYTES || data_len > MAX_INPUT_BYTES || name_len.checked_add(data_len)? != self.input.len() {
++            return None;
++        }
++        let mut inbox = picture.as_ref().unwrap_or(&self.inbox).lock().ok()?;
++        if !inbox.is_empty() {
++            return None;
++        }
++        let name = std::str::from_utf8(self.input.get(..name_len)?).ok()?;
++        if name.contains('\0') {
++            return None;
++        }
++        let name = name.to_owned();
++        self.input.copy_within(name_len.., 0);
++        self.input.truncate(data_len);
++        inbox.push((name, std::mem::take(&mut self.input)));
++        Some(())
++    }
++}
+diff --git a/apps/gridcraft-warp/src/lib.rs b/apps/gridcraft-warp/src/lib.rs
+new file mode 100644
+index 0000000..16617b5
+--- /dev/null
++++ b/apps/gridcraft-warp/src/lib.rs
+@@ -0,0 +1,9 @@
++//! Presentation Manager host bridge for the upstream GridCraft UI.
++#[cfg(target_os = "wasi")]
++mod a11y;
++#[cfg(target_os = "wasi")]
++mod clipboard;
++#[cfg(target_os = "wasi")]
++mod file_bridge;
++#[cfg(target_os = "wasi")]
++mod wasi;
+diff --git a/apps/gridcraft-warp/src/wasi.rs b/apps/gridcraft-warp/src/wasi.rs
+new file mode 100644
+index 0000000..ab3be9b
+--- /dev/null
++++ b/apps/gridcraft-warp/src/wasi.rs
+@@ -0,0 +1,416 @@
++use egui::epaint::{ClippedPrimitive, ImageData, Primitive};
++use egui::{Context, Event, Key, Modifiers, PointerButton, RawInput, Rect, TextureId};
++use gridcraft_engine::Session;
++use gridcraft_ui_egui::SheetApp;
++use std::cell::RefCell;
++
++use crate::a11y::Accessibility;
++use crate::file_bridge::Files;
++
++const MAX_EVENTS: usize = 4096;
++const MAX_TEXT_BURST: usize = 4096;
++const MAX_SIDE: i32 = 4096;
++const MAX_PACKET: usize = 32 << 20;
++const SCALE: f32 = 1.0;
++
++struct Bridge {
++    app: SheetApp,
++    files: Files,
++    context: Context,
++    events: Vec<Event>,
++    buttons: i32,
++    modifiers: Modifiers,
++    focused: bool,
++    should_close: bool,
++    last_tick: Option<u32>,
++    elapsed_ms: u64,
++    repaint_delay_ms: u32,
++    draw: Vec<u8>,
++    accessibility: Accessibility,
++}
++
++thread_local! {
++    static APP: RefCell<Option<Bridge>> = const { RefCell::new(None) };
++}
++
++fn with_app<T>(f: impl FnOnce(&mut Bridge) -> T) -> Option<T> {
++    APP.with(|app| app.try_borrow_mut().ok()?.as_mut().map(f))
++}
++
++fn dimensions(w: i32, h: i32) -> Option<egui::Vec2> {
++    ((1..=MAX_SIDE).contains(&w) && (1..=MAX_SIDE).contains(&h)).then(|| egui::vec2(w as f32, h as f32))
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_init(w: i32, h: i32) -> i32 {
++    if dimensions(w, h).is_none() {
++        return 1;
++    }
++    APP.with(|state| {
++        let Ok(mut state) = state.try_borrow_mut() else { return 1 };
++        if state.is_some() {
++            return 0;
++        }
++        let files = Files::default();
++        let mut session = Session::new();
++        let _ = session.execute("file.new", serde_json::json!({"sample": "sales"}));
++        let mut services = files.services();
++        crate::clipboard::install(&mut services);
++        let mut app = SheetApp::new(session, services);
++        app.ui.autosave = false;
++        let context = Context::default();
++        context.set_pixels_per_point(SCALE);
++        *state = Some(Bridge {
++            app,
++            files,
++            context,
++            events: Vec::new(),
++            buttons: 0,
++            modifiers: Modifiers::default(),
++            focused: true,
++            should_close: false,
++            last_tick: None,
++            elapsed_ms: 0,
++            repaint_delay_ms: u32::MAX,
++            draw: Vec::new(),
++            accessibility: Accessibility::default(),
++        });
++        0
++    })
++}
++
++fn modifiers(mask: i32) -> Modifiers {
++    let ctrl = mask & 2 != 0;
++    Modifiers { shift: mask & 1 != 0, ctrl, alt: mask & 4 != 0, command: ctrl, mac_cmd: false }
++}
++
++fn key(code: i32) -> Option<Key> {
++    let name = match code {
++        8 => "Backspace",
++        9 => "Tab",
++        13 => "Enter",
++        27 => "Escape",
++        127 => "Delete",
++        256 => "ArrowLeft",
++        257 => "ArrowRight",
++        258 => "ArrowUp",
++        259 => "ArrowDown",
++        260 => "Home",
++        261 => "End",
++        262 => "PageUp",
++        263 => "PageDown",
++        264 => "Insert",
++        288 => "F1",
++        289 => "F2",
++        290 => "F3",
++        291 => "F4",
++        292 => "F5",
++        293 => "F6",
++        294 => "F7",
++        295 => "F8",
++        296 => "F9",
++        297 => "F10",
++        298 => "F11",
++        299 => "F12",
++        32..=126 => {
++            let ascii = [(code as u8).to_ascii_uppercase()];
++            return Key::from_name(std::str::from_utf8(&ascii).ok()?);
++        }
++        _ => return None,
++    };
++    Key::from_name(name)
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_event(kind: i32, a: i32, b: i32, c: i32, d: i32) -> i32 {
++    with_app(|state| {
++        if state.events.len() > MAX_EVENTS - 5 {
++            return 1;
++        }
++        let mods = modifiers(d);
++        if mods != state.modifiers {
++            state.events.push(Event::ModifiersChanged(mods));
++            state.modifiers = mods;
++        }
++        match kind {
++            1 => {
++                let scale = state.context.pixels_per_point();
++                let pos = egui::pos2(a as f32 / scale, b as f32 / scale);
++                state.events.push(Event::PointerMoved(pos));
++                for (mask, button) in [(1, PointerButton::Primary), (2, PointerButton::Secondary), (4, PointerButton::Middle)] {
++                    if (state.buttons ^ c) & mask != 0 {
++                        state.events.push(Event::PointerButton { pos, button, pressed: c & mask != 0, modifiers: mods });
++                    }
++                }
++                state.buttons = c & 7;
++            }
++            2 => {
++                if let Some(key) = key(a) {
++                    crate::clipboard::key_event(&mut state.events, key, b != 0, c != 0, mods);
++                }
++            }
++            3 => state.events.push(Event::MouseWheel {
++                unit: egui::MouseWheelUnit::Point,
++                delta: egui::vec2(a as f32, b as f32),
++                phase: egui::TouchPhase::Move,
++                source: egui::MouseWheelSource::Wheel,
++                modifiers: mods,
++            }),
++            crate::a11y::SET_ENABLED => state.accessibility.set_enabled(&state.context, a != 0),
++            crate::a11y::ACTIVATE => {
++                if let Some(event) = state.accessibility.action(a as u32, b as u32) {
++                    state.events.push(event);
++                }
++            }
++            4 => state.events.push(Event::PointerGone),
++            5 => {
++                state.focused = a != 0;
++                state.events.push(Event::WindowFocused(state.focused));
++            }
++            _ => return 1,
++        }
++        0
++    })
++    .unwrap_or(1)
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_text(codepoint: u32) -> i32 {
++    let Some(ch) = char::from_u32(codepoint).filter(|ch| !ch.is_control()) else { return 1 };
++    with_app(|state| {
++        // PM batches key events until the next repaint. The grid begins a cell edit from
++        // the first text event, so keep the rest of that typing burst in the same event.
++        let plain = |mods: Modifiers| !mods.ctrl && !mods.alt && !mods.command && !mods.mac_cmd;
++        let previous = state.events.iter_mut().rev().find(|event| match event {
++            Event::Key { key, modifiers, .. } if plain(*modifiers) => !(key.symbol_or_name().len() == 1 || (*key == Key::Space && !modifiers.shift)),
++            Event::ModifiersChanged(modifiers) if plain(*modifiers) => false,
++            _ => true,
++        });
++        if let Some(Event::Text(text)) = previous
++            && text.len() + ch.len_utf8() <= MAX_TEXT_BURST
++        {
++            text.push(ch);
++            return 0;
++        }
++        if state.events.len() >= MAX_EVENTS {
++            return 1;
++        }
++        state.events.push(Event::Text(ch.to_string()));
++        0
++    })
++    .unwrap_or(1)
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_frame(w: i32, h: i32, time_ms: u32) -> i32 {
++    let Some(size) = dimensions(w, h) else { return 1 };
++    with_app(|state| {
++        let previous_scale = state.context.pixels_per_point();
++        let screen = Rect::from_min_size(egui::Pos2::ZERO, size / previous_scale);
++        if let Some(last_tick) = state.last_tick.replace(time_ms) {
++            state.elapsed_ms = state.elapsed_ms.saturating_add(u64::from(time_ms.wrapping_sub(last_tick)));
++        }
++        let mut input = RawInput {
++            screen_rect: Some(screen),
++            max_texture_side: Some(2048),
++            time: Some(state.elapsed_ms as f64 / 1000.0),
++            events: std::mem::take(&mut state.events),
++            focused: state.focused,
++            ..RawInput::default()
++        };
++        if let Some(root) = input.viewports.get_mut(&egui::ViewportId::ROOT) {
++            root.native_pixels_per_point = Some(SCALE);
++            root.inner_rect = Some(screen);
++            root.focused = Some(state.focused);
++        }
++        let ctx = &state.context;
++        let app = &mut state.app;
++        app.raw_input_hook(ctx, &mut input);
++        let mut logic = true;
++        let frame = ctx.run_ui(input, |ui| {
++            if std::mem::take(&mut logic) {
++                app.logic(ui.ctx());
++            }
++            app.ui(ui);
++        });
++        let scale = frame.pixels_per_point;
++        if let Some(update) = frame.platform_output.accesskit_update {
++            state.accessibility.capture(update, scale);
++        }
++        crate::clipboard::output(&frame.platform_output.commands);
++        if let Some(root) = frame.viewport_output.get(&egui::ViewportId::ROOT) {
++            state.should_close |= root.commands.iter().any(|command| matches!(command, egui::ViewportCommand::Close));
++        }
++        state.repaint_delay_ms = if scale != previous_scale {
++            0
++        } else {
++            frame.viewport_output.get(&egui::ViewportId::ROOT).and_then(|root| u32::try_from(root.repaint_delay.as_millis()).ok()).unwrap_or(u32::MAX)
++        };
++        let primitives = ctx.tessellate(frame.shapes, frame.pixels_per_point);
++        let mut textures = frame.textures_delta;
++        let screen_pixels = Rect::from_min_size(egui::Pos2::ZERO, size);
++        let packed = pack_draw(&mut state.draw, &textures, &primitives, screen_pixels, scale);
++        // The PM host receives every delta in the draw packet and owns its application.
++        textures.clear();
++        if packed.is_some() {
++            0
++        } else {
++            eprintln!("GridCraft's frame exceeded the Presentation Manager bridge limits.");
++            1
++        }
++    })
++    .unwrap_or(1)
++}
++
++/// Delay until the next requested repaint. The native host also wakes for input.
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_repaint_delay_ms() -> u32 {
++    with_app(|state| state.repaint_delay_ms).unwrap_or(u32::MAX)
++}
++
++/// Take one pending document, picture, font or other open request.
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_open_requested() -> i32 {
++    with_app(|state| state.files.take_request()).unwrap_or(0)
++}
++
++/// Allocate linear memory for one incoming filename and its contents.
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_reserve_input(len: usize) -> usize {
++    with_app(|state| state.files.reserve_input(len)).flatten().unwrap_or(0)
++}
++
++/// Deliver the UTF-8 name followed by raw file bytes to GridCraft's own import queue.
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_accept_input(name_len: usize, data_len: usize) -> i32 {
++    with_app(|state| {
++        if state.files.accept_input(name_len, data_len).is_some() {
++            state.context.request_repaint();
++            0
++        } else {
++            1
++        }
++    })
++    .unwrap_or(1)
++}
++
++/// The native window requested a close. `0` lets the upstream save prompt run first.
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_close_request() -> i32 {
++    with_app(|state| {
++        state.app.request_quit(&state.context);
++        state.context.request_repaint();
++        0
++    })
++    .unwrap_or(0)
++}
++
++/// Acknowledge an upstream viewport close after the user has answered the prompt.
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_should_close() -> i32 {
++    with_app(|state| i32::from(std::mem::take(&mut state.should_close))).unwrap_or(0)
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_draw_ptr() -> usize {
++    with_app(|state| state.draw.as_ptr() as usize).unwrap_or(0)
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_draw_len() -> usize {
++    with_app(|state| state.draw.len()).unwrap_or(0)
++}
++
++/// The current native accessibility snapshot remains valid until the next frame.
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_a11y_ptr() -> usize {
++    with_app(|state| state.accessibility.packet.as_ptr() as usize).unwrap_or(0)
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_a11y_len() -> usize {
++    with_app(|state| state.accessibility.packet.len()).unwrap_or(0)
++}
++
++fn texture_number(id: TextureId) -> Option<u32> {
++    let (value, tag) = match id {
++        TextureId::Managed(n) => (n, 0),
++        TextureId::User(n) => (n, 0x8000_0000),
++    };
++    (value < 0x8000_0000).then(|| value as u32 | tag)
++}
++
++fn put_u32(out: &mut Vec<u8>, value: u32) {
++    out.extend_from_slice(&value.to_le_bytes());
++}
++fn put_f32(out: &mut Vec<u8>, value: f32) {
++    out.extend_from_slice(&value.to_le_bytes());
++}
++
++fn pack_draw(out: &mut Vec<u8>, textures: &egui::TexturesDelta, primitives: &[ClippedPrimitive], screen: Rect, scale: f32) -> Option<()> {
++    let pixels = |pos: egui::Pos2| (pos.to_vec2() * scale).to_pos2();
++    let meshes = || {
++        primitives.iter().filter_map(|item| {
++            let Primitive::Mesh(mesh) = &item.primitive else { return None };
++            let clip = Rect::from_min_max(pixels(item.clip_rect.min), pixels(item.clip_rect.max)).intersect(screen);
++            (clip.is_positive() && !mesh.indices.is_empty()).then_some((mesh, clip))
++        })
++    };
++    let updates = || textures.set.iter().flat_map(|(id, deltas)| deltas.iter().map(move |delta| (*id, delta)));
++    let mut bytes = 16usize.checked_add(textures.free.len().checked_mul(4)?)?;
++    let mut set_count = 0u32;
++    for (_, delta) in updates() {
++        set_count = set_count.checked_add(1)?;
++        let ImageData::Color(image) = &delta.image;
++        bytes = bytes.checked_add(20usize.checked_add(image.pixels.len().checked_mul(4)?)?)?;
++    }
++    let mut mesh_count = 0u32;
++    for (mesh, _) in meshes() {
++        bytes = bytes.checked_add(28)?.checked_add(mesh.vertices.len().checked_mul(20)?)?.checked_add(mesh.indices.len().checked_mul(4)?)?;
++        mesh_count = mesh_count.checked_add(1)?;
++    }
++    if bytes > MAX_PACKET {
++        return None;
++    }
++    out.clear();
++    out.try_reserve(bytes).ok()?;
++    out.extend_from_slice(b"WCG1");
++    put_u32(out, set_count);
++    put_u32(out, mesh_count);
++    put_u32(out, u32::try_from(textures.free.len()).ok()?);
++    for (id, delta) in updates() {
++        let ImageData::Color(image) = &delta.image;
++        put_u32(out, texture_number(id)?);
++        let [x, y] = delta.pos.unwrap_or([u32::MAX as usize; 2]);
++        put_u32(out, u32::try_from(x).ok()?);
++        put_u32(out, u32::try_from(y).ok()?);
++        for d in image.size {
++            put_u32(out, u32::try_from(d).ok()?);
++        }
++        for color in &image.pixels {
++            out.extend_from_slice(&color.to_array());
++        }
++    }
++    for (mesh, clip) in meshes() {
++        put_u32(out, texture_number(mesh.texture_id)?);
++        for value in [clip.min.x, clip.min.y, clip.max.x, clip.max.y] {
++            put_f32(out, value);
++        }
++        put_u32(out, u32::try_from(mesh.vertices.len()).ok()?);
++        put_u32(out, u32::try_from(mesh.indices.len()).ok()?);
++        for vertex in &mesh.vertices {
++            let pos = pixels(vertex.pos);
++            for value in [pos.x, pos.y, vertex.uv.x, vertex.uv.y] {
++                put_f32(out, value);
++            }
++            out.extend_from_slice(&vertex.color.to_array());
++        }
++        for index in &mesh.indices {
++            put_u32(out, *index);
++        }
++    }
++    for id in &textures.free {
++        put_u32(out, texture_number(*id)?);
++    }
++    Some(())
++}
+diff --git a/crates/core/Cargo.toml b/crates/core/Cargo.toml
+index e7d3695..e6d34ad 100644
+--- a/crates/core/Cargo.toml
++++ b/crates/core/Cargo.toml
+@@ -13,7 +13,7 @@ serde = { workspace = true }
+ thiserror = { workspace = true }
+ chrono = { workspace = true }
+ 
+-[target.'cfg(target_arch = "wasm32")'.dependencies]
++[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+ js-sys = "0.3"
+ 
+ [dev-dependencies]
+diff --git a/crates/core/src/date.rs b/crates/core/src/date.rs
+index 606d3da..8750ad6 100644
+--- a/crates/core/src/date.rs
++++ b/crates/core/src/date.rs
+@@ -49,11 +49,11 @@ pub fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+ /// Milliseconds since the Unix epoch (UTC) from the system clock; `None` when the clock is unavailable.
+ /// Chrono uses the browser clock on wasm32, where the standard library clock methods trap.
+ pub fn unix_now_ms() -> Option<f64> {
+-    #[cfg(not(target_arch = "wasm32"))]
++    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+     {
+         Some(chrono::Utc::now().timestamp_millis() as f64)
+     }
+-    #[cfg(target_arch = "wasm32")]
++    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+     {
+         Some(js_sys::Date::now())
+     }
+diff --git a/crates/engine/src/cmd/file.rs b/crates/engine/src/cmd/file.rs
+index b3b515c..20efe95 100644
+--- a/crates/engine/src/cmd/file.rs
++++ b/crates/engine/src/cmd/file.rs
+@@ -44,14 +44,19 @@ fn new_workbook(s: &mut Session, p: &Json) -> Result<Json> {
+ }
+ 
+ fn open(s: &mut Session, p: &Json) -> Result<Json> {
++    // A byte-delivery host can supply the document's native path along with its contents.
++    if let Some(path) = str_param(p, "path")
++        && let Some(i) = s
++            .documents()
++            .iter()
++            .position(|d| d.path.as_deref().is_some_and(|open| if cfg!(target_os = "wasi") { open.eq_ignore_ascii_case(path) } else { open == path }))
++    {
++        s.set_active(i);
++        return Ok(json!({"index": i, "alreadyOpen": true}));
++    }
+     let (name, bytes) = if let Some(b) = str_param(p, "base64") {
+         (str_param(p, "name").unwrap_or("Book.xlsx").to_string(), crate::io::base64_decode(b).ok_or_else(|| bad("file.open", "invalid base64"))?)
+     } else if let Some(path) = str_param(p, "path") {
+-        // Already open? Switch to it.
+-        if let Some(i) = s.documents().iter().position(|d| d.path.as_deref() == Some(path)) {
+-            s.set_active(i);
+-            return Ok(json!({"index": i, "alreadyOpen": true}));
+-        }
+         (path.to_string(), crate::io::read_file(path)?)
+     } else {
+         s.ui_requests.push(crate::UiRequest::Dialog("open".into(), json!({})));
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index 6f61b23..16cd1e7 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -370,7 +370,11 @@ impl DocState {
+     pub fn display_title(&self) -> String {
+         self.path
+             .as_deref()
+-            .and_then(|p| std::path::Path::new(p).file_name())
++            .and_then(|p| {
++                #[cfg(target_os = "wasi")]
++                let p = p.rsplit(['\\', '/']).next().unwrap_or(p);
++                std::path::Path::new(p).file_name()
++            })
+             .map(|n| n.to_string_lossy().to_string())
+             .unwrap_or_else(|| self.title.clone())
+     }
+diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
+index 297f7ba..3b2e078 100644
+--- a/crates/ui-egui/Cargo.toml
++++ b/crates/ui-egui/Cargo.toml
+@@ -42,7 +42,7 @@ craft-update = { workspace = true }
+ sys-locale = { workspace = true }
+ craft-window = { workspace = true }
+ 
+-[target.'cfg(target_arch = "wasm32")'.dependencies]
++[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+ # Read the browser's preferred language for the first-run web interface language.
+ web-sys = { version = "0.3", features = ["Window", "Navigator", "Performance"] }
+ 
+diff --git a/crates/ui-egui/src/app/commands.rs b/crates/ui-egui/src/app/commands.rs
+index 86a4a6c..eb5e371 100644
+--- a/crates/ui-egui/src/app/commands.rs
++++ b/crates/ui-egui/src/app/commands.rs
+@@ -26,6 +26,9 @@ impl SheetApp {
+         if matches!(id, "file.save" | "file.saveAs" | "file.saveBytes") {
+             self.store_view_state();
+         }
++        if self.services.host_save.is_some() && matches!(id, "file.save" | "file.saveAs") {
++            return self.save_with_host(id == "file.saveAs");
++        }
+         if matches!(
+             id,
+             "sheet.activate"
+@@ -365,6 +368,10 @@ impl SheetApp {
+                 }
+             }
+             "saveAs" => {
++                if self.services.host_save.is_some() {
++                    self.run_or_alert("file.saveAs", json!({}));
++                    return;
++                }
+                 let suggested = self.session.active().map(|d| d.display_title()).unwrap_or_else(|| "Book1".into());
+                 if let Some(pick) = &self.services.pick_save {
+                     if let Some(path) = pick(&suggested) {
+diff --git a/crates/ui-egui/src/app/files.rs b/crates/ui-egui/src/app/files.rs
+index 0cbde92..e994ba9 100644
+--- a/crates/ui-egui/src/app/files.rs
++++ b/crates/ui-egui/src/app/files.rs
+@@ -84,8 +84,10 @@ impl SheetApp {
+             .map(|i| std::mem::take(&mut *i.lock().unwrap_or_else(std::sync::PoisonError::into_inner)))
+             .unwrap_or_default();
+         for (name, bytes) in arrived {
++            let host_path = self.services.host_save.is_some().then_some(name.as_str());
++            let basename = host_path.and_then(|path| path.rsplit(['\\', '/']).next()).unwrap_or(&name);
+             let b64 = gridcraft_engine::io::base64_encode(&bytes);
+-            match self.run("file.open", json!({"name": &name, "base64": &b64})) {
++            match self.run("file.open", json!({"name": basename, "base64": &b64, "path": host_path})) {
+                 // A file picked from File › Open (web) arrives here: show it, not the Backstage.
+                 Ok(r) => {
+                     self.backstage = None;
+@@ -93,7 +95,7 @@ impl SheetApp {
+                 }
+                 Err(e) if e.contains(gridcraft_engine::io::PASSWORD_REQUIRED) => {
+                     self.backstage = None;
+-                    self.open_dialog("openPassword", json!({"name": name, "base64": b64}));
++                    self.open_dialog("openPassword", json!({"name": basename, "base64": b64}));
+                 }
+                 Err(e) => self.message = Some(("GridCraft".into(), clean_error(&e))),
+             }
+@@ -101,18 +103,60 @@ impl SheetApp {
+         }
+     }
+ 
++    pub(super) fn save_with_host(&mut self, save_as: bool) -> Result<Json, String> {
++        use gridcraft_engine::io::{FileKind, save_bytes_as};
++        let save = self.services.host_save.as_ref().ok_or("No workbook save service")?;
++        let document = self.session.active_mut().ok_or("No workbook is open")?;
++        let path = document
++            .path
++            .as_deref()
++            .filter(|path| matches!(FileKind::from_path(path).or(document.content_kind), Some(FileKind::Xlsx | FileKind::Json)));
++        let save_as = save_as || path.is_none();
++        let name = if let Some(path) = path {
++            path.to_owned()
++        } else {
++            let stem = std::path::Path::new(&document.title).file_stem().and_then(|s| s.to_str()).unwrap_or("Book");
++            format!("{stem}.xlsx")
++        };
++        let basename = name.rsplit(['\\', '/']).next().unwrap_or(&name);
++        let kind = FileKind::from_path(basename).or(document.content_kind).unwrap_or(FileKind::Xlsx);
++        let bytes = save_bytes_as(&document.wb, basename, kind).map_err(|error| error.to_string())?;
++        let Some(path) = save(&name, &bytes, save_as)? else {
++            return Ok(json!({"cancelled": true}));
++        };
++        let source = Some(std::path::PathBuf::from(&path));
++        if document.wb.source_path != source {
++            std::sync::Arc::make_mut(&mut document.wb).source_path = source;
++        }
++        document.saved = document.wb.clone();
++        document.path = Some(path.clone());
++        document.content_kind = Some(kind);
++        Ok(json!({"path": path, "bytes": bytes.len()}))
++    }
++
+     /// AutoSave: save workbooks that have a file shortly after they change. This decision lives in
+     /// `logic` so a hidden or logic-only frame still saves; the monotonic timestamp check keeps a
+     /// forced hidden UI pass from saving the same change twice.
+     pub(super) fn autosave(&mut self, ctx: &egui::Context) {
+-        let dirty_xlsx = self.session.active().is_some_and(|d| d.is_dirty() && d.path.as_deref().is_some_and(|p| p.ends_with(".xlsx")));
++        let dirty_xlsx = self.session.active().is_some_and(|d| {
++            d.is_dirty()
++                && d.path
++                    .as_deref()
++                    .and_then(|p| std::path::Path::new(p).extension())
++                    .and_then(|ext| ext.to_str())
++                    .is_some_and(|ext| ext.eq_ignore_ascii_case("xlsx"))
++        });
+         let now = crate::monotonic_ms();
+         let autosave_due =
+             self.ui.autosave && self.editor.is_none() && self.text_box_editor.is_none() && now - self.grid.last_autosave > 2000.0 && dirty_xlsx;
+         if autosave_due {
+             self.grid.last_autosave = now;
+             self.store_view_state();
+-            let _ = self.session.run("file.save", json!({}));
++            if self.services.host_save.is_some() {
++                let _ = self.save_with_host(false);
++            } else {
++                let _ = self.session.run("file.save", json!({}));
++            }
+         } else if self.ui.autosave && dirty_xlsx {
+             // Keep checking even when no input arrives while the window is hidden.
+             ctx.request_repaint_after(std::time::Duration::from_secs(2));
+diff --git a/crates/ui-egui/src/backstage.rs b/crates/ui-egui/src/backstage.rs
+index 194533d..fabbdf5 100644
+--- a/crates/ui-egui/src/backstage.rs
++++ b/crates/ui-egui/src/backstage.rs
+@@ -696,14 +696,14 @@ fn save_as(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Outcom
+     });
+     ui.add_space(14.0);
+     // Desktop: the system Save dialog. Web: the file downloads.
+-    let web = app.services.pick_save.is_none() && app.services.download.is_some();
++    let web = app.services.host_save.is_none() && app.services.pick_save.is_none() && app.services.download.is_some();
+     let label = if web { format!("{} (.{fmt})", lang.tr("Download")) } else { lang.tr("Browse…").to_string() };
+     if square_button(ui, Icon::OpenFolder, &label).clicked() && app.commit_edit(0, 0, false, false) {
+         if fmt == "xlsx" {
+             let before = app.session.active().map(|d| (d.path.clone(), d.is_dirty()));
+             app.open_dialog("saveAs", json!({}));
+             let after = app.session.active().map(|d| (d.path.clone(), d.is_dirty()));
+-            if after != before || app.services.pick_save.is_none() {
++            if after != before || web {
+                 out.close = true;
+             }
+         } else if export_as(app, fmt) {
+diff --git a/crates/ui-egui/src/clock.rs b/crates/ui-egui/src/clock.rs
+index ca1b577..a2a594c 100644
+--- a/crates/ui-egui/src/clock.rs
++++ b/crates/ui-egui/src/clock.rs
+@@ -10,7 +10,7 @@ pub fn now_ms() -> f64 {
+ /// Deliberately separate from [`now_ms`]: a wall-clock adjustment must not extend (or expire) a
+ /// screenshot deadline or save a workbook twice. Native uses [`std::time::Instant`]; wasm uses the
+ /// browser's `performance.now()`, which is monotonic too.
+-#[cfg(not(target_arch = "wasm32"))]
++#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+ #[allow(clippy::disallowed_methods)] // the std clock is read only off wasm
+ pub fn monotonic_ms() -> f64 {
+     use std::sync::OnceLock;
+@@ -18,7 +18,7 @@ pub fn monotonic_ms() -> f64 {
+     START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
+ }
+ 
+-#[cfg(target_arch = "wasm32")]
++#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+ /// Web monotonic clock: the browser's `performance.now()`, or 0 when it is unavailable.
+ pub fn monotonic_ms() -> f64 {
+     web_sys::window().and_then(|window| window.performance()).map_or(0.0, |performance| performance.now())
+diff --git a/crates/ui-egui/src/dialogs/about.rs b/crates/ui-egui/src/dialogs/about.rs
+index a95878e..9c5b740 100644
+--- a/crates/ui-egui/src/dialogs/about.rs
++++ b/crates/ui-egui/src/dialogs/about.rs
+@@ -18,9 +18,14 @@ pub(super) fn about(ui: &mut egui::Ui, d: &mut Dialog) {
+             ui.heading("GridCraft");
+             ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+             ui.add_space(4.0);
+-            ui.label("A clean-room, open-source, Rust-native spreadsheet. Part of ArtCraft.");
+-            ui.hyperlink_to("getartcraft.com/apps/gridcraft", "https://getartcraft.com/apps/gridcraft");
+-            ui.hyperlink_to("Join the ArtCraft Discord", "https://discord.gg/artcraft");
++            if cfg!(target_os = "wasi") {
++                ui.label("OS/2 port based on GridCraft by the ArtCraft Team and contributors.");
++                ui.hyperlink_to("GridCraft upstream project", "https://github.com/storytold/gridcraft");
++            } else {
++                ui.label("A clean-room, open-source, Rust-native spreadsheet. Part of ArtCraft.");
++                ui.hyperlink_to("getartcraft.com/apps/gridcraft", "https://getartcraft.com/apps/gridcraft");
++                ui.hyperlink_to("Join the ArtCraft Discord", "https://discord.gg/artcraft");
++            }
+         }
+     }
+ }
+diff --git a/crates/ui-egui/src/i18n.rs b/crates/ui-egui/src/i18n.rs
+index 45c336f..48226fb 100644
+--- a/crates/ui-egui/src/i18n.rs
++++ b/crates/ui-egui/src/i18n.rs
+@@ -179,7 +179,11 @@ impl Language {
+         {
+             sys_locale::get_locale().and_then(|tag| Self::from_tag(&tag)).unwrap_or(Self::En)
+         }
+-        #[cfg(target_arch = "wasm32")]
++        #[cfg(target_os = "wasi")]
++        {
++            Self::En
++        }
++        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+         {
+             web_sys::window().and_then(|window| window.navigator().language()).and_then(|tag| Self::from_tag(&tag)).unwrap_or(Self::En)
+         }
+diff --git a/crates/ui-egui/src/services.rs b/crates/ui-egui/src/services.rs
+index 748e23a..5dffa7d 100644
+--- a/crates/ui-egui/src/services.rs
++++ b/crates/ui-egui/src/services.rs
+@@ -3,6 +3,7 @@ use super::printing;
+ type PickSave = Box<dyn Fn(&str) -> Option<String>>;
+ type OpenUrl = Box<dyn Fn(&str)>;
+ type CopyHtml = Box<dyn FnMut(&str, &str) -> Result<(), String>>;
++type HostSave = Box<dyn Fn(&str, &[u8], bool) -> Result<Option<String>, String>>;
+ type Download = Box<dyn Fn(&str, &[u8])>;
+ type PrintPdf = Box<dyn Fn(&[u8])>;
+ 
+@@ -32,6 +33,8 @@ pub struct Services {
+     /// gets it from egui's `Event::Paste`). `None` from the host, or no service (web), pastes
+     /// GridCraft's own clipboard.
+     pub paste_text: Option<Box<dyn FnMut() -> Option<String>>>,
++    /// An embedded host that owns the native Save dialog and writes encoded workbook bytes.
++    pub host_save: Option<HostSave>,
+     /// Web: deliver a file to the user (name, bytes).
+     pub download: Option<Download>,
+     /// Web: start an asynchronous file pick; the bytes arrive later in `inbox`.

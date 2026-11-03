@@ -1,0 +1,10 @@
+ready
+enabled: 1
+valid update: 1, malformed rejected: 1
+activation 1: 7 aabbccdd
+valid update: 1, malformed rejected: 1
+native caret: 34 502 22
+enabled: 0
+enabled: 1
+valid update: 1, malformed rejected: 1
+enabled: 0

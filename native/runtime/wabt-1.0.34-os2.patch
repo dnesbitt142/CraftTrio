@@ -1,0 +1,175 @@
+--- a/wasm2c/wasm-rt-impl.c
++++ b/wasm2c/wasm-rt-impl.c
+@@ -25,18 +25,30 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#ifdef __OS2__
++#define INCL_DOSMEMMGR
++#define INCL_DOSERRORS
++#include <os2.h>
++#endif
++
+ #if WASM_RT_INSTALL_SIGNAL_HANDLER && !defined(_WIN32)
+ #include <signal.h>
+ #include <unistd.h>
+ #endif
+ 
++#if WASM_RT_USE_MMAP || WASM_RT_INSTALL_SIGNAL_HANDLER
+ #ifdef _WIN32
+ #include <windows.h>
+ #else
+ #include <sys/mman.h>
+ #endif
++#endif
+ 
+ #define PAGE_SIZE 65536
++#if defined(__OS2__) && !defined(WC_WASM_MAX_PAGES)
++/* Keep the same 96 MiB limit as the prior OS/2 host. */
++#define WC_WASM_MAX_PAGES (96 * 1024 * 1024 / PAGE_SIZE)
++#endif
+ 
+ #if WASM_RT_INSTALL_SIGNAL_HANDLER
+ static bool g_signal_handler_installed = false;
+@@ -76,6 +88,7 @@
+ #endif
+ }
+ 
++#if WASM_RT_USE_MMAP || WASM_RT_INSTALL_SIGNAL_HANDLER
+ #ifdef _WIN32
+ static void* os_mmap(size_t size) {
+   void* ret = VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_NOACCESS);
+@@ -222,6 +235,7 @@
+ #endif
+ 
+ #endif
++#endif
+ 
+ void wasm_rt_init(void) {
+ #if WASM_RT_INSTALL_SIGNAL_HANDLER
+@@ -270,17 +284,62 @@
+ 
+ #endif
+ 
++#ifdef __OS2__
++static void report_memory_error(const char* api, APIRET rc, ULONG size) {
++  FILE* log = fopen("WCENGINE.LOG", "ab");
++  if (log) {
++    fprintf(log, "%s failed with OS/2 error %lu for %lu bytes\n", api,
++            (unsigned long)rc, (unsigned long)size);
++    fclose(log);
++  }
++}
++#endif
++
+ void wasm_rt_allocate_memory(wasm_rt_memory_t* memory,
+                              uint64_t initial_pages,
+                              uint64_t max_pages,
+                              bool is64) {
++#ifdef WC_WASM_MAX_PAGES
++  if (max_pages > WC_WASM_MAX_PAGES) {
++    max_pages = WC_WASM_MAX_PAGES;
++  }
++  if (is64 || initial_pages > max_pages) {
++    wasm_rt_trap(WASM_RT_TRAP_EXHAUSTION);
++  }
++#endif
+   uint64_t byte_length = initial_pages * PAGE_SIZE;
+   memory->size = byte_length;
+   memory->pages = initial_pages;
+   memory->max_pages = max_pages;
+   memory->is64 = is64;
+ 
+-#if WASM_RT_USE_MMAP
++#if defined(__OS2__)
++  PVOID address = NULL;
++  if (max_pages > UINT32_MAX / PAGE_SIZE) {
++    wasm_rt_trap(WASM_RT_TRAP_EXHAUSTION);
++  }
++  const ULONG reserve_size = (ULONG)(max_pages * PAGE_SIZE);
++  if (reserve_size) {
++    APIRET rc = DosAllocMem(&address, reserve_size, OBJ_ANY | PAG_READ | PAG_WRITE);
++    if (rc == ERROR_INVALID_PARAMETER) {
++      rc = DosAllocMem(&address, reserve_size, PAG_READ | PAG_WRITE);
++    }
++    if (rc) {
++      report_memory_error("DosAllocMem", rc, reserve_size);
++      wasm_rt_trap(WASM_RT_TRAP_EXHAUSTION);
++    }
++    if (byte_length) {
++      rc = DosSetMem(address, (ULONG)byte_length, PAG_COMMIT | PAG_DEFAULT);
++      if (rc) {
++        DosFreeMem(address);
++        report_memory_error("DosSetMem", rc, (ULONG)byte_length);
++        wasm_rt_trap(WASM_RT_TRAP_EXHAUSTION);
++      }
++      memset(address, 0, (size_t)byte_length);
++    }
++  }
++  memory->data = address;
++#elif WASM_RT_USE_MMAP
+   const uint64_t mmap_size = get_allocation_size_for_mmap(memory);
+   void* addr = os_mmap(mmap_size);
+   if (!addr) {
+@@ -294,15 +353,18 @@
+   }
+   memory->data = addr;
+ #else
+-  memory->data = calloc(byte_length, 1);
++  memory->data = calloc((size_t)byte_length, 1);
++  if (byte_length && !memory->data) {
++    wasm_rt_trap(WASM_RT_TRAP_EXHAUSTION);
++  }
+ #endif
+ }
+ 
+ static uint64_t grow_memory_impl(wasm_rt_memory_t* memory, uint64_t delta) {
+   uint64_t old_pages = memory->pages;
+   uint64_t new_pages = memory->pages + delta;
+-  if (new_pages == 0) {
+-    return 0;
++  if (delta == 0) {
++    return old_pages;
+   }
+   if (new_pages < old_pages || new_pages > memory->max_pages) {
+     return (uint64_t)-1;
+@@ -310,14 +372,23 @@
+   uint64_t old_size = old_pages * PAGE_SIZE;
+   uint64_t new_size = new_pages * PAGE_SIZE;
+   uint64_t delta_size = delta * PAGE_SIZE;
+-#if WASM_RT_USE_MMAP
++#if defined(__OS2__)
++  uint8_t* new_data = memory->data;
++  APIRET rc = DosSetMem(new_data + old_size, (ULONG)delta_size,
++                        PAG_COMMIT | PAG_DEFAULT);
++  if (rc) {
++    report_memory_error("DosSetMem", rc, (ULONG)delta_size);
++    return (uint64_t)-1;
++  }
++  memset(new_data + old_size, 0, (size_t)delta_size);
++#elif WASM_RT_USE_MMAP
+   uint8_t* new_data = memory->data;
+   int ret = os_mprotect(new_data + old_size, delta_size);
+   if (ret != 0) {
+     return (uint64_t)-1;
+   }
+ #else
+-  uint8_t* new_data = realloc(memory->data, new_size);
++  uint8_t* new_data = realloc(memory->data, (size_t)new_size);
+   if (new_data == NULL) {
+     return (uint64_t)-1;
+   }
+@@ -346,7 +417,12 @@
+ }
+ 
+ void wasm_rt_free_memory(wasm_rt_memory_t* memory) {
+-#if WASM_RT_USE_MMAP
++#if defined(__OS2__)
++  if (memory->data) {
++    DosFreeMem(memory->data);
++    memory->data = NULL;
++  }
++#elif WASM_RT_USE_MMAP
+   const uint64_t mmap_size = get_allocation_size_for_mmap(memory);
+   os_munmap(memory->data, mmap_size);  // ignore error
+ #else
