@@ -7,6 +7,7 @@
 #include "guest_services.h"
 #include "gui_files.h"
 #include "craftpm.h"
+#include "rng.h"
 
 #define WASI_BADF 8U
 #define WASI_FAULT 21U
@@ -14,8 +15,6 @@
 #define WASI_IO 29U
 #define WASI_NOSYS 52U
 #define WASI_SPIPE 70U
-
-static FILE *entropy;
 
 static uint8_t *memory_span(uint32_t offset, uint32_t length)
 {
@@ -58,9 +57,7 @@ uint32_t wc_wasi_random_get(uint32_t data, uint32_t size)
     if (!size) return 0;
     bytes = memory_span(data, size);
     if (!bytes) return WASI_FAULT;
-    if (!entropy) entropy = fopen("ENTROPY.BIN", "rb");
-    if (!entropy) return WASI_NOSYS;
-    return fread(bytes, 1, size, entropy) == size ? 0 : WASI_IO;
+    return wc_rng_fill(bytes, size) ? 0 : WASI_IO;
 }
 
 uint32_t wc_wasi_clock_time(uint32_t id, uint32_t result)
@@ -172,6 +169,5 @@ int32_t wc_host_save(uint32_t name, uint32_t name_size, uint32_t data, uint32_t 
 
 void wc_guest_services_shutdown(void)
 {
-    if (entropy) fclose(entropy);
-    entropy = NULL;
+    wc_rng_shutdown();
 }

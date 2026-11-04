@@ -13,7 +13,7 @@ if verify(bin, '^;,', 'M') > 0 then do
 end
 
 names = 'WORDCRFT DECKCRFT GRIDCRFT'
-files = 'WORDCRFT.EXE DECKCRFT.EXE GRIDCRFT.EXE CRAFTPM.DLL'
+files = 'WORDCRFT.EXE DECKCRFT.EXE GRIDCRFT.EXE CRAFTPM.DLL RNGTEST.EXE'
 do i = 1 to words(files)
   path = bin || '\' || word(files, i)
   if stream(path, 'C', 'QUERY EXISTS') = '' then do
@@ -21,6 +21,15 @@ do i = 1 to words(files)
     exit 1
   end
 end
+
+say 'Checking the native random source...'
+address cmd '"' || bin || '\RNGTEST.EXE" >"' || root || 'RNGTEST.LOG" 2>&1'
+if rc \= 0 then do
+  say 'Native random source check failed. See' root || 'RNGTEST.LOG'
+  say 'Read STARTUP.TXT for CPU and virtual machine requirements.'
+  exit 1
+end
+say 'Native random source check passed; ENTROPY.BIN is not required.'
 
 call RxFuncAdd 'SysLoadFuncs', 'REXXUTIL', 'SysLoadFuncs'
 call SysLoadFuncs

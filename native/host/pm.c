@@ -15,6 +15,7 @@
 #include "a11y.h"
 #include "network.h"
 #include "clipboard.h"
+#include "rng.h"
 
 #define WM_WCG_START (WM_USER + 1)
 #define WM_WCG_PICK_INPUT (WM_USER + 3)
@@ -115,6 +116,7 @@ static const char *invoke(WcOperation op, const int32_t *values, uint32_t *resul
     wasm_float_mode();
     error = app_engine->call(op, values, result);
     app.busy = 0;
+    if (error && wc_rng_error()) return wc_rng_error();
     return error;
 }
 
@@ -555,6 +557,10 @@ static void start(HWND window)
     uint32_t status;
     const char *error;
     if (!dimensions(window, size)) { fail("Could not start the application", "The client window has no size"); return; }
+    log_line("Initializing native random source", "jitterentropy 3.7.0, OSR 3, health tests enabled");
+    error = wc_rng_prepare();
+    if (error) { fail("Could not initialize the native random source", error); return; }
+    log_line("Native random source", "ready; ENTROPY.BIN is not required");
     log_line("Starting linked engine", NULL);
     app.busy = 1;
     wasm_float_mode();

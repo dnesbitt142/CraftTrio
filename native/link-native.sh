@@ -14,21 +14,29 @@ mkdir -p "$build/objects"
 compile() {
     local source=$1
     shift
-    wcc386 -q -bt=os2 -3s -zp4 -mf -zastd=c99 -ot "$@" \
+    "$WATCOM/binl64/wcc386" -q -bt=os2 -3s -zp4 -mf -zastd=c99 -ot "$@" \
         "-i=\"$build/engine\"" "-i=\"$kit/runtime\"" "-i=\"$kit/host\"" \
+        "-i=\"$kit/vendor/jitterentropy\"" \
         "-fi=\"$kit/host/owcompat.h\"" -dWASM_RT_USE_MMAP=0 -dWASM_RT_SKIP_SIGNAL_RECOVERY=1 \
         "-fo=\"$build/objects/$(basename "$source" .c).obj\"" "\"$source\""
 }
 
 cd "$build"
 if [[ $app = host ]]; then
-    common=(pm raster gui_files guest_services a11y clipboard gui_print network)
+    common=(pm raster gui_files guest_services rng a11y clipboard gui_print network)
     for unit in "${common[@]}"; do compile "$kit/host/$unit.c" -bd; done
+    # Timing jitter is invalid if the compiler optimizes its measured loops.
+    # -od overrides the common host's -ot for every upstream library unit.
+    jitter=(base gcd health noise sha3 status timer)
+    for unit in "${jitter[@]}"; do
+        compile "$kit/vendor/jitterentropy/src/jitterentropy-$unit.c" -bd -od;
+    done
     output=CRAFTPM.DLL
     {
         printf 'system os2v2_dll initinstance terminstance\noption quiet\noption manyautodata\n'
         printf 'segment type data nonshared\nname %s\nlibrary os2386\nexport wc_pm_get_api\n' "$output"
         for unit in "${common[@]}"; do printf 'file objects/%s.obj\n' "$unit"; done
+        for unit in "${jitter[@]}"; do printf 'file objects/jitterentropy-%s.obj\n' "$unit"; done
     } > craft.lnk
 else
     case "$app" in
@@ -58,7 +66,7 @@ else
 fi
 
 test ! -e "$output" || unlink "$output"
-wlink @craft.lnk
+"$WATCOM/binl64/wlink" @craft.lnk
 file -b "$output" | grep -q 'LX.*OS/2'
 if [[ $app != host ]]; then
     python3 "$kit/../icons/bind-icon.py" "${output%.EXE}" "$output" \
