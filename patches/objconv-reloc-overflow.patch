@@ -1,0 +1,134 @@
+--- a/elf2cof.cpp
++++ b/elf2cof.cpp
+@@ -193,6 +193,41 @@
+          if (NewAlign > 14) NewAlign = 14;   // limit for highest alignment
+          NewHeader.Flags |= PE_SCN_ALIGN_1 * NewAlign;
+ 
++         // COFF has only a 16-bit count in its section header. Count first so
++         // large generated functions cannot silently wrap that field. The
++         // overflow sentinel includes itself (Microsoft PE/COFF; LLVM writer).
++         uint64_t RelocationCount = 0;
++         for (relsec = 1; relsec < this->NSections; relsec++) {
++            OldRelHeader = this->SectionHeaders[relsec];
++            if ((OldRelHeader.sh_type == SHT_REL || OldRelHeader.sh_type == SHT_RELA)
++            && OldRelHeader.sh_info == oldsec) {
++               uint32_t ExpectedSize = (OldRelHeader.sh_type == SHT_RELA) ?
++                  sizeof(TELF_Relocation) : sizeof(TELF_Relocation) - this->WordSize / 8;
++               if (OldRelHeader.sh_entsize != ExpectedSize ||
++                   OldRelHeader.sh_size % ExpectedSize != 0) {
++                  err.submit(2033); return;
++               }
++               if (uint64_t(OldRelHeader.sh_offset) + uint64_t(OldRelHeader.sh_size) >
++                   this->GetDataSize()) {
++                  err.submit(2035); return;
++               }
++               RelocationCount += uint64_t(OldRelHeader.sh_size) / ExpectedSize;
++            }
++         }
++         if (RelocationCount >= UINT32_MAX) { err.submit(2035); return; }
++         NewHeader.NRelocations = (uint16_t)(RelocationCount > 0xFFFF ?
++                                            0xFFFF : RelocationCount);
++         if (RelocationCount) {
++            NewHeader.PRelocations = NewRawData.GetDataSize() + RawDataOffset;
++            if (RelocationCount > 0xFFFF) {
++               NewHeader.Flags |= PE_SCN_LNK_NRELOC_OVFL;
++               SCOFF_Relocation ExtendedCount;
++               memset(&ExtendedCount, 0, sizeof(ExtendedCount));
++               ExtendedCount.VirtualAddress = (uint32_t)RelocationCount + 1;
++               NewRawData.Push(&ExtendedCount, SIZE_SCOFF_Relocation);
++            }
++         }
++
+          // Find relocation table for this section by searching through all sections
+          for (relsec = 1; relsec < this->NSections; relsec++) {
+ 
+@@ -213,9 +248,6 @@
+                   sizeof(TELF_Relocation) :                    // Elf32_Rela, Elf64_Rela
+                   sizeof(TELF_Relocation) - this->WordSize/8;  // Elf32_Rel,  Elf64_Rel
+                if (entrysize < expectedentrysize) {err.submit(2033); entrysize = expectedentrysize;}
+-
+-               // File pointer for new relocations
+-               NewHeader.PRelocations = NewRawData.GetDataSize() + RawDataOffset;   // file  to relocation entries
+ 
+                // Loop through relocation table entries
+                for (; reltab < reltabend; reltab += entrysize) {
+@@ -355,7 +387,6 @@
+ 
+                   // Store relocation entry
+                   NewRawData.Push(&NewRelocation, SIZE_SCOFF_Relocation);
+-                  NewHeader.NRelocations++;
+ 
+                   // Remember that symbol is used
+                   if (OldRelocation.r_type) {
+@@ -602,7 +633,8 @@
+                   && OldSecHdr[1].sh_info == OldSym.st_shndx // and if next section refers to current section
+                   && OldSecHdr[1].sh_entsize > 0) { // Avoid division by 0
+                      // Calculate number of relocations
+-                     AuxSym.section.NumberOfRelocations = (uint16_t)(uint32_t(OldSecHdr[1].sh_size) / uint32_t(OldSecHdr[1].sh_entsize));
++                     uint64_t Count = uint64_t(OldSecHdr[1].sh_size) / uint64_t(OldSecHdr[1].sh_entsize);
++                     AuxSym.section.NumberOfRelocations = (uint16_t)(Count > 0xFFFF ? 0xFFFF : Count);
+                   }
+                }
+                // Store auxiliary record
+--- a/cof2omf.cpp
++++ b/cof2omf.cpp
+@@ -277,17 +277,44 @@
+    for (j = 0; j < NSections; j++) {
+       SCOFF_SectionHeader * SectionHeaderp = &SectionHeaders[j];
+ 
+-      // Pointer to first relocation entry in section
+-      Reloc.b = Buf() + SectionHeaderp->PRelocations;
+-
+-      // Loop through relocations in section
+-      for (i = 0; i < SectionHeaderp->NRelocations; i++) {
++      // Validate counts before computing pointers. Extended COFF counts use
++      // a synthetic first entry whose count includes that entry itself.
++      uint32_t Count = SectionHeaderp->NRelocations;
++      uint64_t Offset = SectionHeaderp->PRelocations;
++      if (SectionHeaderp->Flags & PE_SCN_LNK_NRELOC_OVFL) {
++         if (Count != 0xFFFF || Offset == 0 ||
++             Offset + SIZE_SCOFF_Relocation > GetDataSize()) {
++            err.submit(2035); return;
++         }
++         SCOFF_Relocation First;
++         memcpy(&First, Buf() + (uint32_t)Offset, SIZE_SCOFF_Relocation);
++         if (First.VirtualAddress < 0x10000 || First.SymbolTableIndex != 0 || First.Type != 0) {
++            err.submit(2035); return;
++         }
++         Count = First.VirtualAddress - 1;
++         Offset += SIZE_SCOFF_Relocation;
++      }
++      if ((Count && Offset == 0) ||
++          Offset + uint64_t(Count) * SIZE_SCOFF_Relocation > GetDataSize()) {
++         err.submit(2035); return;
++      }
++      if (!Count) continue;
++      Reloc.b = Buf() + (uint32_t)Offset;
++
++      // Advance even when ABS/NONE records are ignored or an entry is skipped.
++      for (i = 0; i < Count; i++, Reloc.b += SIZE_SCOFF_Relocation) {
++         if (Reloc.p->Type == COFF32_RELOC_ABS) continue;
++         if (Reloc.p->VirtualAddress > SectionHeaderp->SizeOfRawData ||
++             SectionHeaderp->SizeOfRawData - Reloc.p->VirtualAddress < 4 ||
++             uint64_t(SectionHeaderp->PRawData) + SectionHeaderp->SizeOfRawData > GetDataSize()) {
++            err.submit(2035); return;
++         }
+ 
+          // Find symbol table entry
+          isym = Reloc.p->SymbolTableIndex;
+          if ((uint32_t)isym >= (uint32_t)NumberOfSymbols) {
+             err.submit(2040);                    // SymbolTableIndex points outside Symbol Table
+-            isym = 0;
++            return;
+          }
+          Symtab.p = SymbolTable;                 // Set pointer to begin of SymbolTable
+          Symtab.b += SIZE_SCOFF_SymTableEntry * isym; // Calculate address of entry isym
+@@ -348,8 +375,6 @@
+          // Put NewRel into RelocationBuffer
+          RelocationBuffer.Push(NewRel);
+ 
+-         // Increment pointer to relocation record
+-         Reloc.b += SIZE_SCOFF_Relocation;       // Next relocation record
+       }
+    }
+    // Sort RelocationBuffer

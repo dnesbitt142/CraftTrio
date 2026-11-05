@@ -17,9 +17,14 @@
 #include "clipboard.h"
 #include "rng.h"
 
-#define WM_WCG_START (WM_USER + 1)
-#define WM_WCG_PICK_INPUT (WM_USER + 3)
+/* Keep control messages away from common dialog/extension message values.
+ * The instance tokens below, rather than the numbers alone, identify our
+ * requests when a modal dialog dispatches messages to its owner. */
+#define WM_WCG_START (WM_USER + 0x5a0)
+#define WM_WCG_PICK_INPUT (WM_USER + 0x5a1)
 #define POINTER_TIMER 1
+#define FRAME_TIMER 2
+#define FRAME_WAKE_MS 16U
 #define MAX_VIEW_WIDTH 2560
 #define MAX_VIEW_HEIGHT 1600
 #define MAX_DRAW_PACKET (48UL * 1024 * 1024)
@@ -30,8 +35,6 @@ static struct App {
     HWND frame, client;
     FILE *log;
     WcRaster *raster;
-    uint8_t *bitmap;
-    size_t bitmap_capacity;
     uint32_t bitmap_width, bitmap_height;
     uint32_t started_at;
     uint32_t repaint_at;
@@ -39,14 +42,22 @@ static struct App {
     uint32_t buttons;
     uint16_t keys[256];
     int inside, busy, ready, failed, needs_frame, repaint_scheduled;
+    int start_attempted;
+    int rendering, frame_timer_armed, frame_timer_reported;
+    uint32_t frame_timer_at;
     int pointer_x, pointer_y, pointer_modifier_mask;
     int reported_draw_error;
     unsigned long frames;
+    uint32_t engine_capabilities;
+    uint32_t committed_bytes, reclaimed_bytes;
+    uint32_t next_memory_report;
 } app;
 
 static const WcPmConfig *app_config;
 static const WcPmEngine *app_engine;
 static int app_started;
+static const char start_message_token = 'S';
+static const char input_message_token = 'I';
 
 const WcPmConfig *wc_pm_config(void)
 {
@@ -73,11 +84,21 @@ static void log_line(const char *stage, const char *detail)
     }
 }
 
+/* FRAME_TIMER is periodic in PM but consumed as a one-shot. Disarm before
+ * rendering so a nested modal loop cannot repeatedly wake a busy engine. */
+static void cancel_frame_wake(void)
+{
+    if (!app.frame_timer_armed) return;
+    app.frame_timer_armed = 0;
+    if (app.client) WinStopTimer(app.anchor, app.client, FRAME_TIMER);
+}
+
 static void fail(const char *stage, const char *detail)
 {
     char message[512];
     if (app.failed) return;
     app.failed = 1;
+    cancel_frame_wake();
     (void)wc_print_finish(1);
     log_line(stage, detail);
     if (app.client) WinStopTimer(app.anchor, app.client, POINTER_TIMER);
@@ -129,10 +150,36 @@ static int dimensions(HWND window, int32_t *size)
     return 1;
 }
 
+/* Coalesce explicit input/resize/startup requests into one short low-priority
+ * PM timer. Egui-only repaint deadlines remain on the original 250 ms timer,
+ * preserving its idle animation cadence and avoiding extra idle timer wakes. */
+static void schedule_frame_wake(void)
+{
+    uint32_t target;
+    if (!app.ready || app.failed || app.busy || app.rendering || !app.client) return;
+    if (!WinIsWindowShowing(app.client) || !app.needs_frame) {
+        cancel_frame_wake();
+        return;
+    }
+    target = ticks() + FRAME_WAKE_MS;
+    if (app.frame_timer_armed && (int32_t)(target - app.frame_timer_at) >= 0) return;
+    cancel_frame_wake();
+    /* Claim before PM can reenter; further input cannot postpone this wake. */
+    app.frame_timer_at = target;
+    app.frame_timer_armed = 1;
+    if (!WinStartTimer(app.anchor, app.client, FRAME_TIMER, FRAME_WAKE_MS)) {
+        app.frame_timer_armed = 0;
+        if (!app.frame_timer_reported) {
+            log_line("Fast frame timer", "unavailable; using the 250 ms fallback");
+            app.frame_timer_reported = 1;
+        }
+    }
+}
+
 static void request_frame(void)
 {
-    /* A low-priority PM timer drains queued keyboard and mouse input first. */
     app.needs_frame = 1;
+    schedule_frame_wake();
 }
 
 static void input_error(const char *message)
@@ -157,7 +204,8 @@ static void cancel_input(void)
 static void pick_input(uint32_t kind)
 {
     char name[WC_GUI_PATH_CAP];
-    unsigned char *data, *memory;
+    unsigned char *memory;
+    WcInput *input;
     uint32_t length, offset, result;
     int32_t args[2];
     size_t name_len, total, memory_size;
@@ -165,7 +213,7 @@ static void pick_input(uint32_t kind)
     int picked;
     if (!app.ready || app.failed || app.busy) return;
     app.busy = 1;
-    picked = wc_gui_pick_input(kind, name, &data, &length);
+    picked = wc_gui_pick_input(kind, name, &input, &length);
     app.busy = 0;
     if (picked <= 0) {
         cancel_input();
@@ -177,22 +225,29 @@ static void pick_input(uint32_t kind)
     args[0] = (int32_t)total;
     error = invoke(WCR_RESERVE_INPUT, args, &offset);
     if (error) {
-        free(data);
+        wc_input_discard(input);
         fail("Could not allocate input storage", error);
         return;
     }
     /* reserve_input can grow the guest memory. Reacquire its base and size. */
     memory = wc_pm_memory(&memory_size);
     if (!offset || !memory || offset > memory_size || total > memory_size - offset) {
-        free(data);
+        wc_input_discard(input);
         input_error("Could not allocate storage for the selected file.");
         cancel_input();
         request_frame();
         return;
     }
     memcpy(memory + offset, name, name_len);
-    if (length) memcpy(memory + offset + name_len, data, length);
-    free(data);
+    /* No PM calls or engine calls while a pointer into the engine is held.
+     * Reading directly avoids a second, potentially 16 MiB native copy. */
+    error = wc_input_read_close(input, memory + offset + name_len, length);
+    if (error) {
+        input_error(error);
+        cancel_input();
+        request_frame();
+        return;
+    }
     args[0] = (int32_t)name_len;
     args[1] = (int32_t)length;
     error = invoke(WCR_ACCEPT_INPUT, args, &result);
@@ -200,6 +255,8 @@ static void pick_input(uint32_t kind)
     if (result) {
         input_error("Could not accept the selected file.");
         cancel_input();
+    } else {
+        wc_gui_input_accepted(kind, name);
     }
     request_frame();
 }
@@ -215,7 +272,8 @@ static void after_frame(HWND window)
     if (error) { fail("Could not check the file request", error); return; }
     if (result) {
         if (result > 4) { fail("Could not open the file picker", "Unknown file request"); return; }
-        if (!WinPostMsg(window, WM_WCG_PICK_INPUT, MPFROMLONG(result), 0)) {
+        if (!WinPostMsg(window, WM_WCG_PICK_INPUT, MPFROMLONG(result),
+                        MPFROMP(&input_message_token))) {
             input_error("Could not open the file picker.");
             cancel_input();
         }
@@ -237,42 +295,22 @@ static void close_window(HWND window)
     else request_frame();
 }
 
-static int stage_bitmap(void)
+static int update_bitmap_geometry(void)
 {
-    const uint8_t *pixels, *source;
-    uint8_t *target, *grown;
-    uint32_t width, height, y, x;
-    size_t stride, row, bytes;
+    const uint8_t *pixels;
+    uint32_t width, height;
+    size_t stride, row;
     pixels = wc_raster_pixels(app.raster, &width, &height, &stride);
     if (!pixels || !width || !height || width > MAX_VIEW_WIDTH ||
-        height > MAX_VIEW_HEIGHT || stride < (size_t)width * 4) return 0;
+        height > MAX_VIEW_HEIGHT) return 0;
     row = ((size_t)width * 3 + 3) & ~(size_t)3;
-    bytes = row * height;
-    if (bytes > app.bitmap_capacity) {
-        grown = realloc(app.bitmap, bytes);
-        if (!grown) return 0;
-        app.bitmap = grown;
-        app.bitmap_capacity = bytes;
-    }
-    /* PM wants bottom-up BGR rows aligned to 32 bits. */
-    for (y = 0; y < height; ++y) {
-        source = pixels + (size_t)(height - 1 - y) * stride;
-        target = app.bitmap + (size_t)y * row;
-        for (x = 0; x < width; ++x) {
-            target[0] = source[0];
-            target[1] = source[1];
-            target[2] = source[2];
-            target += 3;
-            source += 4;
-        }
-        memset(target, 0, row - (size_t)width * 3);
-    }
+    if (stride != row) return 0;
     app.bitmap_width = width;
     app.bitmap_height = height;
     return 1;
 }
 
-static void render_frame(HWND window)
+static void render_frame_contents(HWND window)
 {
     int32_t args[3];
     const char *error;
@@ -308,7 +346,14 @@ static void render_frame(HWND window)
         fail("Could not rasterize the application", wc_raster_error(app.raster));
         return;
     }
-    if (!stage_bitmap()) { fail("Could not display the application", "Bitmap allocation failed"); return; }
+    if (app.engine_capabilities & WC_ENGINE_DRAW_CONSUMED) {
+        error = invoke(WCR_DRAW_CONSUMED, NULL, &status);
+        if (error || status) {
+            fail("Could not release the consumed draw packet", error ? error : "The engine rejected the release");
+            return;
+        }
+    }
+    if (!update_bitmap_geometry()) { fail("Could not display the application", "Invalid native bitmap"); return; }
     error = invoke(WCR_REPAINT_DELAY, NULL, &repaint_delay);
     if (error) { fail("Could not schedule the next frame", error); return; }
     WinInvalidateRect(window, NULL, FALSE);
@@ -325,6 +370,32 @@ static void render_frame(HWND window)
         snprintf(report, sizeof(report), "%lu bytes after startup", (unsigned long)size);
         log_line("Engine linear memory", report);
     }
+    if (app.frames == 3 || resized) {
+        WcRasterMemory allocations;
+        wc_raster_memory(app.raster, &allocations);
+        snprintf(report, sizeof(report), "surface %lu, vertices %lu, textures %lu bytes; no display copy",
+                 (unsigned long)allocations.surface_bytes,
+                 (unsigned long)allocations.vertex_bytes,
+                 (unsigned long)allocations.texture_bytes);
+        log_line("Host render allocations", report);
+    }
+    /* Query native page flags at most once per second during interaction;
+     * keep the first startup frames and resize transitions observable. */
+    if ((app.engine_capabilities & WC_ENGINE_MEMORY_STATS) &&
+        (app.frames <= 3 || resized || (int32_t)(ticks() - app.next_memory_report) >= 0)) {
+        uint32_t committed, reclaimed;
+        error = invoke(WCR_MEMORY_COMMITTED, NULL, &committed);
+        if (!error) error = invoke(WCR_MEMORY_RECLAIMED, NULL, &reclaimed);
+        if (error) { fail("Could not query engine memory", error); return; }
+        app.next_memory_report = ticks() + 1000;
+        if (app.frames == 3 || committed != app.committed_bytes || reclaimed != app.reclaimed_bytes) {
+            snprintf(report, sizeof(report), "%lu committed bytes, %lu decommitted unused bytes",
+                     (unsigned long)committed, (unsigned long)reclaimed);
+            log_line("Engine page accounting", report);
+            app.committed_bytes = committed;
+            app.reclaimed_bytes = reclaimed;
+        }
+    }
     /* Allow the engine to finish loading fonts over its first passes. */
     if (app.frames < 3) app.needs_frame = 1;
     if (wc_a11y_enabled()) {
@@ -337,22 +408,43 @@ static void render_frame(HWND window)
     after_frame(window);
 }
 
+static void render_frame(HWND window)
+{
+    if (app.rendering || !app.ready || app.failed || app.busy) return;
+    app.rendering = 1;
+    render_frame_contents(window);
+    app.rendering = 0;
+    schedule_frame_wake();
+}
+
+static void frame_wake(HWND window)
+{
+    if (window != app.client || !app.frame_timer_armed ||
+        (int32_t)(ticks() - app.frame_timer_at) < 0) return;
+    cancel_frame_wake();
+    render_frame(window);
+}
+
 static void paint(HWND window)
 {
     RECTL invalid, area;
     HPS ps;
     BITMAPINFO2 info;
+    const uint8_t *bitmap;
+    uint32_t width, height;
+    size_t stride;
     POINTL points[4];
     char report[64];
     ps = WinBeginPaint(window, NULLHANDLE, &invalid);
     if (!ps) return;
-    if (!app.bitmap || !WinQueryWindowRect(window, &area)) {
+    bitmap = wc_raster_pixels(app.raster, &width, &height, &stride);
+    if (!bitmap || !width || !height || !WinQueryWindowRect(window, &area)) {
         WinFillRect(ps, &invalid, SYSCLR_WINDOW);
     } else {
         memset(&info, 0, sizeof(info));
         info.cbFix = sizeof(BITMAPINFOHEADER2);
-        info.cx = app.bitmap_width;
-        info.cy = app.bitmap_height;
+        info.cx = width;
+        info.cy = height;
         info.cPlanes = 1;
         info.cBitCount = 24;
         /* Fill the resized client with the last frame while the application reflows
@@ -363,9 +455,9 @@ static void paint(HWND window)
         points[1].y = area.yTop - 1;
         points[2].x = 0;
         points[2].y = 0;
-        points[3].x = app.bitmap_width;
-        points[3].y = app.bitmap_height;
-        if (GpiDrawBits(ps, app.bitmap, &info, 4, points, ROP_SRCCOPY, BBO_IGNORE) == GPI_ERROR &&
+        points[3].x = width;
+        points[3].y = height;
+        if (GpiDrawBits(ps, (PBYTE)bitmap, &info, 4, points, ROP_SRCCOPY, BBO_IGNORE) == GPI_ERROR &&
             !app.reported_draw_error) {
             snprintf(report, sizeof(report), "PM error 0x%08lx", (unsigned long)WinGetLastError(app.anchor));
             log_line("GpiDrawBits", report);
@@ -556,6 +648,12 @@ static void start(HWND window)
     int32_t size[2];
     uint32_t status;
     const char *error;
+    /* WinFileDlg and message boxes run nested PM loops. A duplicate startup
+     * message must never re-enter the engine, including while it is saving
+     * or displaying an initialization error. Claim the attempt before any
+     * call that could dispatch another window message. */
+    if (app.start_attempted || app.ready || app.busy || app.failed) return;
+    app.start_attempted = 1;
     if (!dimensions(window, size)) { fail("Could not start the application", "The client window has no size"); return; }
     log_line("Initializing native random source", "jitterentropy 3.7.0, OSR 3, health tests enabled");
     error = wc_rng_prepare();
@@ -575,6 +673,13 @@ static void start(HWND window)
         fail("Could not initialize the application engine", error ? error : "The Rust UI returned an error");
         return;
     }
+    /* Original ABI1 EXEs report an unsupported operation here. They remain
+     * compatible and simply keep their old draw-packet lifetime policy. */
+    status = 0;
+    error = invoke(WCR_CAPABILITIES, NULL, &status);
+    app.engine_capabilities = error ? 0 : status;
+    log_line("Draw packet lifetime", app.engine_capabilities & WC_ENGINE_DRAW_CONSUMED ?
+             "released after native rendering" : "legacy engine");
     app.started_at = ticks();
     app.ready = 1;
     if (!WinStartTimer(app.anchor, window, POINTER_TIMER, 250)) {
@@ -591,14 +696,22 @@ static MRESULT EXPENTRY client_proc(HWND window, ULONG msg, MPARAM mp1, MPARAM m
     int delta;
     MRESULT result;
     switch (msg) {
-    case WM_WCG_START: start(window); return 0;
-    case WM_WCG_PICK_INPUT: pick_input((uint32_t)mp1); return 0;
+    case WM_WCG_START:
+        if (window == app.client && mp1 == MPFROMP(&start_message_token) &&
+            mp2 == MPFROMP(&app)) { start(window); return 0; }
+        break;
+    case WM_WCG_PICK_INPUT:
+        if (window == app.client && mp2 == MPFROMP(&input_message_token)) {
+            pick_input((uint32_t)mp1);
+            return 0;
+        }
+        break;
     case WM_PAINT: paint(window); return 0;
     case WM_ERASEBACKGROUND: return MRFROMSHORT(TRUE);
     case WM_SIZE:
         result = WinDefWindowProc(window, msg, mp1, mp2);
         request_frame();
-        if (app.bitmap && WinIsWindowShowing(window)) {
+        if (app.bitmap_width && app.bitmap_height && WinIsWindowShowing(window)) {
             WinInvalidateRect(window, NULL, FALSE);
             WinUpdateWindow(window);
         }
@@ -636,7 +749,9 @@ static MRESULT EXPENTRY client_proc(HWND window, ULONG msg, MPARAM mp1, MPARAM m
         send_event(5, SHORT1FROMMP(mp2) != 0, 0, 0, 0);
         break;
     case WM_TIMER:
-        if (SHORT1FROMMP(mp1) == POINTER_TIMER) {
+        if (SHORT1FROMMP(mp1) == FRAME_TIMER) {
+            frame_wake(window);
+        } else if (SHORT1FROMMP(mp1) == POINTER_TIMER) {
             check_pointer(window);
             if (wc_network_ready()) request_frame();
             render_frame(window);
@@ -686,7 +801,8 @@ static int run_app(const WcPmConfig *config, const WcPmEngine *engine)
         goto done;
     }
     WinSetFocus(HWND_DESKTOP, app.client);
-    if (!WinPostMsg(app.client, WM_WCG_START, 0, 0)) {
+    if (!WinPostMsg(app.client, WM_WCG_START, MPFROMP(&start_message_token),
+                    MPFROMP(&app))) {
         log_line("Could not post application startup", NULL);
         goto done;
     }
@@ -695,6 +811,7 @@ static int run_app(const WcPmConfig *config, const WcPmEngine *engine)
     exit_code = app.failed ? 1 : 0;
 done:
     app.ready = 0;
+    cancel_frame_wake();
     if (app.client) WinStopTimer(app.anchor, app.client, POINTER_TIMER);
     wc_a11y_shutdown();
     wc_network_shutdown();
@@ -705,7 +822,6 @@ done:
     if (app.raster) wc_raster_destroy(app.raster);
     app_engine->shutdown();
     wc_guest_services_shutdown();
-    free(app.bitmap);
     if (app.log) fclose(app.log);
     app_config = NULL;
     app_engine = NULL;

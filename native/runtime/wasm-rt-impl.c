@@ -45,6 +45,13 @@
 #endif
 
 #define PAGE_SIZE 65536
+#define WC_NATIVE_PAGE 4096U
+#define WC_MEMORY_REGIONS 128U
+typedef struct {
+  const wasm_rt_memory_t* memory;
+  uint32_t offset, length, committed;
+} WcMemoryRegion;
+static WcMemoryRegion wc_memory_regions[WC_MEMORY_REGIONS];
 #if defined(__OS2__) && !defined(WC_WASM_MAX_PAGES)
 /* Keep the same 96 MiB limit as the prior OS/2 host. */
 #define WC_WASM_MAX_PAGES (96 * 1024 * 1024 / PAGE_SIZE)
@@ -335,7 +342,7 @@ void wasm_rt_allocate_memory(wasm_rt_memory_t* memory,
         report_memory_error("DosSetMem", rc, (ULONG)byte_length);
         wasm_rt_trap(WASM_RT_TRAP_EXHAUSTION);
       }
-      memset(address, 0, (size_t)byte_length);
+      /* Fresh OS/2 private pages are zero-filled on demand. Do not prefault them. */
     }
   }
   memory->data = address;
@@ -380,7 +387,7 @@ static uint64_t grow_memory_impl(wasm_rt_memory_t* memory, uint64_t delta) {
     report_memory_error("DosSetMem", rc, (ULONG)delta_size);
     return (uint64_t)-1;
   }
-  memset(new_data + old_size, 0, (size_t)delta_size);
+  /* This unused suffix is zero-filled on first access by the OS/2 pager. */
 #elif WASM_RT_USE_MMAP
   uint8_t* new_data = memory->data;
   int ret = os_mprotect(new_data + old_size, delta_size);
@@ -417,6 +424,10 @@ uint64_t wasm_rt_grow_memory(wasm_rt_memory_t* memory, uint64_t delta) {
 }
 
 void wasm_rt_free_memory(wasm_rt_memory_t* memory) {
+  unsigned int wc_i;
+  for (wc_i = 0; wc_i < WC_MEMORY_REGIONS; ++wc_i)
+    if (wc_memory_regions[wc_i].memory == memory)
+      memset(&wc_memory_regions[wc_i], 0, sizeof(wc_memory_regions[wc_i]));
 #if defined(__OS2__)
   if (memory->data) {
     DosFreeMem(memory->data);
@@ -427,6 +438,151 @@ void wasm_rt_free_memory(wasm_rt_memory_t* memory) {
   os_munmap(memory->data, mmap_size);  // ignore error
 #else
   free(memory->data);
+#endif
+}
+
+uint64_t wasm_rt_reclaimed_memory_bytes(const wasm_rt_memory_t* memory) {
+  uint64_t bytes = 0;
+  unsigned int i;
+  for (i = 0; i < WC_MEMORY_REGIONS; ++i) {
+    const WcMemoryRegion* region = &wc_memory_regions[i];
+    if (region->memory == memory) {
+#if defined(__OS2__)
+      uint32_t scanned = 0;
+      /* Query actual mappings, including a possible partial failed commit.
+       * Unknown/query-failed ranges count as committed, never overclaimed. */
+      while (scanned < region->length) {
+        ULONG extent = region->length - scanned, flags = 0;
+        if (DosQueryMem(memory->data + region->offset + scanned, &extent, &flags) ||
+            !extent) break;
+        if (extent > region->length - scanned) extent = region->length - scanned;
+        if (!(flags & (PAG_COMMIT | PAG_FREE))) bytes += extent;
+        scanned += extent;
+      }
+#else
+      bytes += (uint64_t)region->length - region->committed;
+#endif
+    }
+  }
+  return bytes;
+}
+
+#if defined(__OS2__)
+/* Idempotently restore access by querying homogeneous mapped runs. This also
+ * handles an OS call that committed only part of a requested range. */
+static int wc_restore_user_pages(uint8_t* address, uint32_t length) {
+  while (length) {
+    ULONG extent = length, flags = 0;
+    APIRET rc = DosQueryMem(address, &extent, &flags);
+    if (rc || !extent || (extent & (WC_NATIVE_PAGE - 1U))) {
+      report_memory_error("DosQueryMem restore", rc ? rc : ERROR_INVALID_PARAMETER, length);
+      return 0;
+    }
+    if (extent > length) extent = length;
+    if ((flags & (PAG_COMMIT | PAG_READ | PAG_WRITE | PAG_GUARD)) !=
+        (PAG_COMMIT | PAG_READ | PAG_WRITE)) {
+      ULONG wanted = PAG_READ | PAG_WRITE;
+      if (!(flags & PAG_COMMIT)) wanted |= PAG_COMMIT;
+      rc = DosSetMem(address, extent, wanted);
+      if (rc) { report_memory_error("DosSetMem restore", rc, extent); return 0; }
+    }
+    address += extent;
+    length -= extent;
+  }
+  return 1;
+}
+#endif
+
+uint64_t wasm_rt_committed_memory_bytes(const wasm_rt_memory_t* memory) {
+  const uint64_t reclaimed = wasm_rt_reclaimed_memory_bytes(memory);
+  return memory && reclaimed <= memory->size ? memory->size - reclaimed : 0;
+}
+
+/* This ledger contains no guest pointers to decommitted memory. Its records
+ * describe user bytes of still-owned System allocations, never libc headers,
+ * free lists, Rust objects, stack or module data. Registering ownership is the
+ * allocator's responsibility; subsequent operations are checked here as well.
+ * Every registered object has an accessible prefix and a decommitted suffix.
+ */
+uint32_t wasm_rt_memory_pages(wasm_rt_memory_t* memory, uint32_t operation,
+                              uint32_t offset, uint32_t length) {
+#if defined(__OS2__) || defined(WC_MEMORY_RECLAIM_TEST)
+  unsigned int i;
+  int vacant = -1;
+  WcMemoryRegion* found = NULL;
+  if (!memory || !memory->data || !length ||
+      (offset & (WC_NATIVE_PAGE - 1U)) ||
+      (length & (WC_NATIVE_PAGE - 1U)) ||
+      offset > memory->size || length > memory->size - offset)
+    return 1;
+  for (i = 0; i < WC_MEMORY_REGIONS; ++i) {
+    WcMemoryRegion* region = &wc_memory_regions[i];
+    if (!region->memory) { if (vacant < 0) vacant = (int)i; continue; }
+    if (region->memory != memory) continue;
+    if ((uint64_t)offset < (uint64_t)region->offset + region->length &&
+        (uint64_t)region->offset < (uint64_t)offset + length) {
+      if (operation == 0) return 1; /* no aliases or overlapping owners */
+      if (offset >= region->offset &&
+          (uint64_t)offset + length <= (uint64_t)region->offset + region->length)
+        found = region;
+      else
+        return 1;
+    }
+  }
+  if (operation == 0) {
+    if (vacant < 0) return 1;
+    found = &wc_memory_regions[vacant];
+    found->memory = memory;
+    found->offset = offset;
+    found->length = length;
+    found->committed = length;
+    return 0;
+  }
+  if (!found) return 1;
+  if (operation == 3) {
+    if (offset != found->offset || length != found->length ||
+        found->committed != found->length) return 1;
+    memset(found, 0, sizeof(*found));
+    return 0;
+  }
+  if (operation == 1) {
+    if ((uint64_t)offset != (uint64_t)found->offset + found->committed ||
+        length > found->length - found->committed) return 1;
+#if defined(__OS2__)
+    if (!wc_restore_user_pages(memory->data + offset, length)) return 1;
+#endif
+    memset(memory->data + offset, 0, length);
+    found->committed += length;
+    return 0;
+  }
+  if (operation == 2) {
+    if (offset < found->offset ||
+        (uint64_t)offset + length != (uint64_t)found->offset + found->committed)
+      return 1;
+#if defined(__OS2__)
+    {
+      APIRET rc = DosSetMem(memory->data + offset, length, PAG_DECOMMIT);
+      if (rc) {
+        report_memory_error("DosSetMem decommit", rc, length);
+        /* Do not assume a failed multi-page kernel call was atomic. Return a
+         * recoverable error only after every affected page is accessible.
+         * If rollback cannot restore access, stop the engine instead of ever
+         * returning an inaccessible pointer from its allocator. */
+        if (!wc_restore_user_pages(memory->data + offset, length))
+          wasm_rt_trap(WASM_RT_TRAP_EXHAUSTION);
+        return 1;
+      }
+    }
+#endif
+    found->committed -= length;
+    return 0;
+  }
+  return 1;
+#else
+  /* Plain calloc/realloc hosts cannot safely decommit their unaligned base.
+   * Refuse registration so the Rust wrapper falls back to ordinary System. */
+  (void)memory; (void)operation; (void)offset; (void)length;
+  return 1;
 #endif
 }
 
