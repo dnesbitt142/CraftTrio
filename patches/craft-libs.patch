@@ -69,3 +69,398 @@ index d1cbcd4..25706a7 100644
  pub fn loading(_ctx: &egui::Context) -> bool {
      false
  }
+diff --git a/vendor/krilla/src/graphics/image.rs b/vendor/krilla/src/graphics/image.rs
+index 1c4f073..9e2b321 100644
+--- a/vendor/krilla/src/graphics/image.rs
++++ b/vendor/krilla/src/graphics/image.rs
+@@ -8,6 +8,7 @@
+ //! - WEBP
+ //! - Custom image formats via [`CustomImage`]
+ 
++use std::any::TypeId;
+ use std::fmt::{Debug, Formatter};
+ use std::hash::{Hash, Hasher};
+ use std::io::Cursor;
+@@ -16,20 +17,21 @@ use std::sync::Arc;
+ 
+ use pdf_writer::{Finish, Name, Ref};
+ use png::{BitDepth, ColorType, Transformations};
+-use zune_jpeg::zune_core::colorspace::ColorSpace;
++use siphasher::sip128::{Hasher128, SipHasher13};
+ use zune_jpeg::JpegDecoder;
++use zune_jpeg::zune_core::colorspace::ColorSpace;
+ 
++use crate::Data;
+ use crate::chunk_container::ChunkContainer;
+ use crate::configure::ValidationError;
+ use crate::error::KrillaError;
+-use crate::graphics::color::device_n::DeviceNSpace;
+ use crate::graphics::color::DEVICE_GRAY;
+-use crate::graphics::color::{cmyk, luma, rgb, ColorSpace as PdfColorSpace, SpecialColorSpace};
++use crate::graphics::color::device_n::DeviceNSpace;
++use crate::graphics::color::{ColorSpace as PdfColorSpace, SpecialColorSpace, cmyk, luma, rgb};
+ use crate::graphics::icc::{GenericICCProfile, ICCBasedColorSpace, ICCProfile};
+ use crate::serialize::SerializeContext;
+-use crate::stream::{deflate_encode, FilterStreamBuilder};
+-use crate::util::{set_colorspace, Deferred, NameExt, SipHashable};
+-use crate::Data;
++use crate::stream::{FilterStreamBuilder, deflate_encode, deflate_encoder};
++use crate::util::{Deferred, NameExt, SipHashable, set_colorspace};
+ 
+ /// The number of bits per color component.
+ #[derive(Debug, Hash, Eq, PartialEq, Copy, Clone)]
+@@ -293,7 +295,16 @@ impl Image {
+     /// Returns an error if the dimensions of the image and the length of the
+     /// data don't match.
+     pub fn from_custom<T: CustomImage>(image: T, interpolate: bool) -> Result<Image, String> {
+-        let hash = (image.clone(), interpolate).sip_hash();
++        // Hash the image by reference. Cloning a custom image may duplicate a
++        // complete decoded raster merely to calculate this content hash.
++        let hash = {
++            let mut state = SipHasher13::new();
++            // Keep the previous owned-tuple type tag and value hash, without
++            // requiring a temporary `(image.clone(), interpolate)` value.
++            TypeId::of::<(T, bool)>().hash(&mut state);
++            (&image, interpolate).hash(&mut state);
++            state.finish128().as_u128()
++        };
+         let mut metadata = ImageMetadata {
+             size: image.size(),
+             color_space: image.color_space(),
+@@ -586,7 +597,7 @@ fn png_metadata(data: &[u8]) -> Result<ImageMetadata, String> {
+         ColorType::Rgb => (ImageColorspace::Rgb, false),
+         ColorType::Rgba => (ImageColorspace::Rgb, true),
+         ColorType::Indexed => {
+-            return Err("image uses an indexed color space, which is unsupported".to_string())
++            return Err("image uses an indexed color space, which is unsupported".to_string());
+         }
+     };
+     let icc = info
+@@ -793,94 +804,75 @@ fn decode_webp(data: Data) -> Result<Repr, String> {
+     }))
+ }
+ 
+-/// Craft patch: an empty vector with room for `capacity` bytes, or an error instead of the
+-/// allocation failure that would end the process. Splitting a decoded image into colour and alpha
+-/// briefly needs about twice its size beside the decoded pixels.
+-fn try_buffer(capacity: usize) -> Result<Vec<u8>, String> {
+-    let mut v = Vec::new();
+-    v.try_reserve_exact(capacity)
+-        .map_err(|_| "image is too large".to_string())?;
+-    Ok(v)
+-}
+-
+ type SplitImage = (Vec<u8>, Option<Vec<u8>>, BitsPerComponent);
+ 
+-fn handle_u8_image(data: &[u8], cs: ColorSpace) -> Result<SplitImage, String> {
+-    let mut alphas = if cs.has_alpha() {
+-        try_buffer(data.len() / cs.num_components())?
+-    } else {
+-        Vec::new()
+-    };
+-
+-    let color_channel = match cs {
+-        ColorSpace::RGB => deflate_encode(data),
+-        ColorSpace::RGBA => {
+-            let mut buf = try_buffer(data.len() * 3 / 4)?;
+-            data.chunks_exact(4).for_each(|data| {
+-                buf.extend_from_slice(&data[0..3]);
+-                alphas.push(data[3]);
+-            });
+-            deflate_encode(&buf)
++/// Compress interleaved color/alpha directly in bounded chunks. The old path
++/// allocated a complete color raster and alpha raster beside `data` before
++/// compressing either. Only compressed output grows here; scratch is 8 KiB.
++fn stream_image_channels(
++    data: &[u8],
++    color_bytes: usize,
++    alpha_bytes: usize,
++) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
++    use std::io::Write;
++
++    const PIXELS_PER_CHUNK: usize = 1024;
++    let pixel_bytes = color_bytes + alpha_bytes;
++    let needs_alpha = data
++        .chunks_exact(pixel_bytes)
++        .any(|pixel| pixel[color_bytes..].iter().any(|byte| *byte != 255));
++    let mut color = deflate_encoder();
++    let mut alpha = needs_alpha.then(deflate_encoder);
++    let mut color_chunk = [0u8; 6 * PIXELS_PER_CHUNK];
++    let mut alpha_chunk = [0u8; 2 * PIXELS_PER_CHUNK];
++    for chunk in data.chunks(PIXELS_PER_CHUNK * pixel_bytes) {
++        let mut color_len = 0;
++        let mut alpha_len = 0;
++        for pixel in chunk.chunks_exact(pixel_bytes) {
++            color_chunk[color_len..color_len + color_bytes].copy_from_slice(&pixel[..color_bytes]);
++            color_len += color_bytes;
++            if alpha.is_some() {
++                alpha_chunk[alpha_len..alpha_len + alpha_bytes]
++                    .copy_from_slice(&pixel[color_bytes..]);
++                alpha_len += alpha_bytes;
++            }
+         }
+-        ColorSpace::Luma => deflate_encode(data),
+-        ColorSpace::LumaA => {
+-            let mut buf = try_buffer(data.len() / 2)?;
+-            data.chunks_exact(2).for_each(|data| {
+-                buf.push(data[0]);
+-                alphas.push(data[1]);
+-            });
+-            deflate_encode(&buf)
++        color
++            .write_all(&color_chunk[..color_len])
++            .map_err(|error| error.to_string())?;
++        if let Some(alpha) = &mut alpha {
++            alpha
++                .write_all(&alpha_chunk[..alpha_len])
++                .map_err(|error| error.to_string())?;
+         }
+-        // PNG/WEBP/GIF only support those three, so should be enough?
+-        _ => unimplemented!(),
+-    };
++    }
++    Ok((
++        color.finish().map_err(|error| error.to_string())?,
++        alpha
++            .map(|encoder| encoder.finish().map_err(|error| error.to_string()))
++            .transpose()?,
++    ))
++}
+ 
+-    let alpha_channel = if !alphas.is_empty() && alphas.iter().any(|v| *v != 255) {
+-        Some(deflate_encode(&alphas))
+-    } else {
+-        None
++fn handle_u8_image(data: &[u8], cs: ColorSpace) -> Result<SplitImage, String> {
++    let (color, alpha) = match cs {
++        ColorSpace::RGB | ColorSpace::Luma => (deflate_encode(data), None),
++        ColorSpace::RGBA => stream_image_channels(data, 3, 1)?,
++        ColorSpace::LumaA => stream_image_channels(data, 1, 1)?,
++        // PNG/WEBP/GIF only support those four, so should be enough.
++        _ => unimplemented!(),
+     };
+-
+-    Ok((color_channel, alpha_channel, BitsPerComponent::Eight))
++    Ok((color, alpha, BitsPerComponent::Eight))
+ }
+ 
+ fn handle_u16_image(data: &[u8], cs: ColorSpace) -> Result<SplitImage, String> {
+-    let mut alphas = if cs.has_alpha() {
+-        try_buffer(data.len() / cs.num_components())?
+-    } else {
+-        Vec::new()
+-    };
+-
+-    let encoded_image = match cs {
+-        ColorSpace::RGB => deflate_encode(data),
+-        ColorSpace::RGBA => {
+-            let mut buf = try_buffer(data.len() * 3 / 4)?;
+-            data.chunks_exact(8).for_each(|data| {
+-                buf.extend_from_slice(&data[0..6]);
+-                alphas.extend_from_slice(&data[6..]);
+-            });
+-            deflate_encode(&buf)
+-        }
+-        ColorSpace::Luma => deflate_encode(data),
+-        ColorSpace::LumaA => {
+-            let mut buf = try_buffer(data.len() / 2)?;
+-            data.chunks_exact(4).for_each(|data| {
+-                buf.extend_from_slice(&data[0..2]);
+-                alphas.extend_from_slice(&data[2..]);
+-            });
+-            deflate_encode(&buf)
+-        }
+-        // PNG/WEBP/GIF only support those three, so should be enough?
++    let (color, alpha) = match cs {
++        ColorSpace::RGB | ColorSpace::Luma => (deflate_encode(data), None),
++        ColorSpace::RGBA => stream_image_channels(data, 6, 2)?,
++        ColorSpace::LumaA => stream_image_channels(data, 2, 2)?,
+         _ => unimplemented!(),
+     };
+-
+-    let encoded_mask = if !alphas.is_empty() {
+-        Some(deflate_encode(&alphas))
+-    } else {
+-        None
+-    };
+-
+-    Ok((encoded_image, encoded_mask, BitsPerComponent::Sixteen))
++    Ok((color, alpha, BitsPerComponent::Sixteen))
+ }
+ 
+ fn get_icc_profile_type(data: &[u8], color_space: ImageColorspace) -> Option<GenericICCProfile> {
+@@ -912,7 +904,11 @@ mod tests {
+             for &b in bytes {
+                 c ^= u32::from(b);
+                 for _ in 0..8 {
+-                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
++                    c = if c & 1 != 0 {
++                        0xEDB8_8320 ^ (c >> 1)
++                    } else {
++                        c >> 1
++                    };
+                 }
+             }
+             !c
+@@ -931,7 +927,11 @@ mod tests {
+         ihdr.extend_from_slice(&height.to_be_bytes());
+         ihdr.extend_from_slice(&[16, 6, 0, 0, 0]);
+         chunk(&mut out, b"IHDR", &ihdr);
+-        chunk(&mut out, b"IDAT", &[0x78, 0x9C, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01]);
++        chunk(
++            &mut out,
++            b"IDAT",
++            &[0x78, 0x9C, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
++        );
+         chunk(&mut out, b"IEND", &[]);
+         out
+     }
+@@ -945,14 +945,102 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn rgba_split_buffers_are_reserved_fallibly() {
+-        assert!(super::try_buffer(usize::MAX).is_err());
+-        let (color, alpha, _) = super::handle_u8_image(&[1, 2, 3, 128, 4, 5, 6, 255], super::ColorSpace::RGBA).unwrap();
++    fn rgba_channels_preserve_alpha_and_bit_depth() {
++        let (color, alpha, _) =
++            super::handle_u8_image(&[1, 2, 3, 128, 4, 5, 6, 255], super::ColorSpace::RGBA).unwrap();
+         assert!(!color.is_empty() && alpha.is_some());
+         let (_, alpha, _) = super::handle_u16_image(&[0; 16], super::ColorSpace::RGBA).unwrap();
+         assert!(alpha.is_some());
+     }
+ 
++    #[test]
++    fn streamed_interleaved_channels_match_legacy_compression() {
++        for pixels in [0, 1, 17, 1023, 1024, 1025, 4099] {
++            for (colors, alpha_bytes) in [(3, 1), (1, 1), (6, 2), (2, 2)] {
++                for opaque in [false, true] {
++                    let pixel_bytes = colors + alpha_bytes;
++                    let mut data: Vec<u8> = (0..pixels * pixel_bytes)
++                        .map(|i| ((i * 73 + i / 7) % 251) as u8)
++                        .collect();
++                    if opaque {
++                        for pixel in data.chunks_exact_mut(pixel_bytes) {
++                            pixel[colors..].fill(255);
++                        }
++                    }
++                    let mut legacy_color = Vec::new();
++                    let mut legacy_alpha = Vec::new();
++                    for pixel in data.chunks_exact(pixel_bytes) {
++                        legacy_color.extend_from_slice(&pixel[..colors]);
++                        legacy_alpha.extend_from_slice(&pixel[colors..]);
++                    }
++                    let expected_alpha = (!legacy_alpha.is_empty()
++                        && legacy_alpha.iter().any(|a| *a != 255))
++                    .then(|| super::deflate_encode(&legacy_alpha));
++                    let (color, alpha) =
++                        super::stream_image_channels(&data, colors, alpha_bytes).unwrap();
++                    assert_eq!(
++                        color,
++                        super::deflate_encode(&legacy_color),
++                        "colors={colors} alpha={alpha_bytes} pixels={pixels}"
++                    );
++                    assert_eq!(
++                        alpha, expected_alpha,
++                        "alpha={alpha_bytes} pixels={pixels} opaque={opaque}"
++                    );
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn custom_image_hash_does_not_clone_a_raster() {
++        use std::hash::{Hash, Hasher};
++        use std::sync::atomic::{AtomicUsize, Ordering};
++        static CLONES: AtomicUsize = AtomicUsize::new(0);
++        struct Samples(Vec<u8>);
++        impl Clone for Samples {
++            fn clone(&self) -> Self {
++                CLONES.fetch_add(1, Ordering::SeqCst);
++                Self(self.0.clone())
++            }
++        }
++        impl Hash for Samples {
++            fn hash<H: Hasher>(&self, state: &mut H) {
++                self.0.hash(state);
++            }
++        }
++        impl super::CustomImage for Samples {
++            fn color_channel(&self) -> &[u8] {
++                &self.0
++            }
++            fn alpha_channel(&self) -> Option<&[u8]> {
++                None
++            }
++            fn bits_per_component(&self) -> super::BitsPerComponent {
++                super::BitsPerComponent::Eight
++            }
++            fn size(&self) -> (u32, u32) {
++                (1, 1)
++            }
++            fn icc_profile(&self) -> Option<&[u8]> {
++                None
++            }
++            fn color_space(&self) -> super::ImageColorspace {
++                super::ImageColorspace::Rgb
++            }
++        }
++        use super::SipHashable;
++        let samples = Samples(vec![10, 20, 30]);
++        let expected = (samples.clone(), false).sip_hash();
++        CLONES.store(0, Ordering::SeqCst);
++        let image = Image::from_custom(samples, false).unwrap();
++        assert_eq!(CLONES.load(Ordering::SeqCst), 0);
++        assert_eq!(
++            image.0.sip, expected,
++            "content-cache identity must remain unchanged"
++        );
++    }
++
+     #[test]
+     fn invalid_jpeg_image() {
+         let e = Image::from_jpeg(Arc::new(b"dfngiudfg".to_vec()).into(), false);
+diff --git a/vendor/krilla/src/stream.rs b/vendor/krilla/src/stream.rs
+index 3d98a4d..627d221 100644
+--- a/vendor/krilla/src/stream.rs
++++ b/vendor/krilla/src/stream.rs
+@@ -27,10 +27,11 @@
+ use std::borrow::Cow;
+ use std::ops::DerefMut;
+ 
+-use flate2::write::ZlibEncoder;
+ use flate2::Compression;
++use flate2::write::ZlibEncoder;
+ use pdf_writer::{Array, Dict, Name};
+ 
++use crate::SerializeSettings;
+ use crate::chunk_container::ChunkContainer;
+ use crate::configure::ValidationError;
+ use crate::content::ContentBuilder;
+@@ -38,7 +39,6 @@ use crate::geom::{Rect, Transform};
+ use crate::resource::{ResourceDictionary, ResourceDictionaryBuilder};
+ use crate::serialize::SerializeContext;
+ use crate::surface::Surface;
+-use crate::SerializeSettings;
+ 
+ /// A stream.
+ ///
+@@ -342,11 +342,15 @@ fn deflate_encode_memoized(data: &[u8]) -> Vec<u8> {
+     deflate_encode(data)
+ }
+ 
++pub(crate) fn deflate_encoder() -> ZlibEncoder<Vec<u8>> {
++    const COMPRESSION_LEVEL: u8 = 6;
++    ZlibEncoder::new(Vec::new(), Compression::new(COMPRESSION_LEVEL as u32))
++}
++
+ pub(crate) fn deflate_encode(data: &[u8]) -> Vec<u8> {
+     use std::io::Write;
+ 
+-    const COMPRESSION_LEVEL: u8 = 6;
+-    let mut e = ZlibEncoder::new(Vec::new(), Compression::new(COMPRESSION_LEVEL as u32));
++    let mut e = deflate_encoder();
+     e.write_all(data).unwrap();
+     e.finish().unwrap()
+ }

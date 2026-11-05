@@ -1,5 +1,6 @@
 /* Software renderer for WordCraft's Open Watcom host. MIT OR Apache-2.0. */
 #include "raster.h"
+#include "surface.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -14,20 +15,21 @@
 #define HALF_PIXEL (SUBPIXEL / 2)
 
 typedef struct {
-    uint8_t b, g, r, a;
-} Bgra;
+    uint8_t b, g, r;
+} Bgr;
 
 typedef struct {
     uint32_t id, width, height;
-    /* Packed sRGBA, with red in the least significant byte. */
-    uint32_t *pixels;
+    /* One byte when R=G=B=A everywhere, otherwise four-byte sRGBA. */
+    uint32_t format;
+    uint8_t *pixels;
 } Texture;
 
 typedef struct {
     unsigned slot;
-    uint32_t id, x, y, width, height;
+    uint32_t id, x, y, width, height, format;
     const uint8_t *pixels;
-    uint32_t *replacement;
+    uint8_t *replacement;
 } Upload;
 
 typedef struct {
@@ -63,15 +65,13 @@ struct WcRaster {
     Texture textures[MAX_TEXTURES];
     Texture planned[MAX_TEXTURES];
     Upload uploads[MAX_TEXTURES];
-    Bgra *pixels;
-    size_t pixel_capacity;
+    WcSurface surface;
     Vertex *vertices;
     size_t vertex_capacity;
-    uint32_t width, height;
     const char *error;
 };
 
-typedef char require_four_byte_pixels[sizeof(Bgra) == 4 ? 1 : -1];
+typedef char require_three_byte_pixels[sizeof(Bgr) == 3 ? 1 : -1];
 typedef char require_four_byte_floats[sizeof(float) == 4 ? 1 : -1];
 
 static uint32_t le32(const uint8_t *data)
@@ -103,7 +103,8 @@ static int dimensions(uint32_t width, uint32_t height, size_t *count)
     if (!width || !height || width > MAX_SIDE || height > MAX_SIDE ||
         width > MAX_BYTES / 4U / height)
         return 0;
-    *count = (size_t)width * height;
+    if (count)
+        *count = (size_t)width * height;
     return 1;
 }
 
@@ -122,11 +123,39 @@ static int texture_slot(const Texture *textures, uint32_t id, int allow_new)
     return allow_new ? vacant : -1;
 }
 
-static void copy_texels(uint32_t *out, const uint8_t *in, size_t count)
+/* Coverage-only font/white textures are lossless with one byte per texel.
+ * Colored glyphs and all other images retain the exact RGBA representation. */
+static uint32_t texel_format(const uint8_t *in, size_t count)
 {
     size_t i;
-    for (i = 0; i < count; ++i)
-        out[i] = le32(in + i * 4U);
+    for (i = 0; i < count; ++i, in += 4U)
+        if (in[0] != in[1] || in[0] != in[2] || in[0] != in[3])
+            return 4U;
+    return 1U;
+}
+
+static void copy_texels(uint8_t *out, const uint8_t *in, size_t count,
+                         uint32_t format)
+{
+    size_t i;
+    if (format == 4U) {
+        memcpy(out, in, count * 4U);
+    } else {
+        for (i = 0; i < count; ++i)
+            out[i] = in[i * 4U];
+    }
+}
+
+static void expand_mask(uint8_t *out, const uint8_t *in, size_t count)
+{
+    size_t i;
+    for (i = 0; i < count; ++i) {
+        const uint8_t coverage = in[i];
+        out[i * 4U] = coverage;
+        out[i * 4U + 1U] = coverage;
+        out[i * 4U + 2U] = coverage;
+        out[i * 4U + 3U] = coverage;
+    }
 }
 
 static void discard_uploads(WcRaster *raster, uint32_t count)
@@ -138,10 +167,11 @@ static void discard_uploads(WcRaster *raster, uint32_t count)
     }
 }
 
-/* Validate all texture updates against shadow metadata. Keep full replacements
- * private until the complete frame has passed validation. */
+/* Validate against shadow metadata without allocating or modifying textures.
+ * The marker is used only to indicate occupied slots, never as pixel data. */
 static int plan_uploads(WcRaster *raster, Reader *reader, uint32_t count)
 {
+    static uint8_t occupied;
     uint32_t i;
     size_t cache_size = 0;
     memcpy(raster->planned, raster->textures, sizeof(raster->planned));
@@ -170,6 +200,7 @@ static int plan_uploads(WcRaster *raster, Reader *reader, uint32_t count)
         upload->pixels = take(reader, bytes);
         if (!upload->pixels)
             return 0;
+        upload->format = texel_format(upload->pixels, pixels);
         full = upload->x == UINT32_MAX && upload->y == UINT32_MAX;
         slot = texture_slot(raster->planned, upload->id, full);
         if (slot < 0)
@@ -181,23 +212,56 @@ static int plan_uploads(WcRaster *raster, Reader *reader, uint32_t count)
                 cache_size -= (size_t)texture->width * texture->height * 4U;
             if (bytes > MAX_BYTES - cache_size)
                 return 0;
-            upload->replacement = malloc(bytes);
-            if (!upload->replacement) {
-                raster->error = "Not enough memory for an egui texture.";
-                return 0;
-            }
-            copy_texels(upload->replacement, upload->pixels, pixels);
             texture->id = upload->id;
             texture->width = upload->width;
             texture->height = upload->height;
-            texture->pixels = upload->replacement;
+            texture->format = upload->format;
+            texture->pixels = &occupied;
             cache_size += bytes;
         } else if (upload->width > texture->width ||
                    upload->height > texture->height ||
                    upload->x > texture->width - upload->width ||
                    upload->y > texture->height - upload->height) {
             return 0;
+        } else {
+            /* A colored partial update promotes a mask; partial updates never
+             * guess whether the rest of an RGBA texture could be compressed. */
+            if (upload->format == 4U)
+                texture->format = 4U;
+            upload->format = texture->format;
         }
+    }
+    return 1;
+}
+
+/* Allocate every required replacement before committing anything. Simulate the
+ * updates in order so repeated full updates can reuse same-sized storage,
+ * including a replacement allocated by an earlier update in this packet. */
+static int allocate_uploads(WcRaster *raster, uint32_t count)
+{
+    uint32_t i;
+    memcpy(raster->planned, raster->textures, sizeof(raster->planned));
+    for (i = 0; i < count; ++i) {
+        Upload *upload = &raster->uploads[i];
+        Texture *texture = &raster->planned[upload->slot];
+        if (upload->x == UINT32_MAX && upload->y == UINT32_MAX) {
+            if (!texture->pixels || texture->width != upload->width ||
+                texture->height != upload->height || texture->format != upload->format) {
+                upload->replacement = malloc((size_t)upload->width * upload->height * upload->format);
+                if (!upload->replacement)
+                    return 0;
+                texture->pixels = upload->replacement;
+            }
+            texture->id = upload->id;
+            texture->width = upload->width;
+            texture->height = upload->height;
+        } else if (texture->format != upload->format) {
+            upload->replacement = malloc((size_t)texture->width * texture->height * upload->format);
+            if (!upload->replacement)
+                return 0;
+            texture->pixels = upload->replacement;
+        }
+        texture->format = upload->format;
     }
     return 1;
 }
@@ -208,21 +272,37 @@ static void apply_uploads(WcRaster *raster, uint32_t count)
     for (i = 0; i < count; ++i) {
         Upload *upload = &raster->uploads[i];
         Texture *texture = &raster->textures[upload->slot];
-        if (upload->replacement) {
-            free(texture->pixels);
-            texture->pixels = upload->replacement;
-            upload->replacement = NULL;
+        if (upload->x == UINT32_MAX && upload->y == UINT32_MAX) {
+            if (upload->replacement) {
+                free(texture->pixels);
+                texture->pixels = upload->replacement;
+                upload->replacement = NULL;
+            }
             texture->id = upload->id;
             texture->width = upload->width;
             texture->height = upload->height;
+            texture->format = upload->format;
+            copy_texels(texture->pixels, upload->pixels,
+                        (size_t)upload->width * upload->height, texture->format);
         } else {
             uint32_t row;
+            if (upload->replacement) {
+                /* Earlier uploads have now been applied. Preserve those
+                 * texels when upgrading a mask before this colored patch. */
+                expand_mask(upload->replacement, texture->pixels,
+                            (size_t)texture->width * texture->height);
+                free(texture->pixels);
+                texture->pixels = upload->replacement;
+                upload->replacement = NULL;
+                texture->format = upload->format;
+            }
             for (row = 0; row < upload->height; ++row) {
                 const size_t dest = (size_t)(upload->y + row) *
                                     texture->width + upload->x;
                 const size_t source = (size_t)row * upload->width * 4U;
-                copy_texels(texture->pixels + dest, upload->pixels + source,
-                            upload->width);
+                copy_texels(texture->pixels + dest * texture->format,
+                            upload->pixels + source,
+                            upload->width, texture->format);
             }
         }
     }
@@ -431,21 +511,28 @@ static unsigned sample_coord(double texel, uint32_t extent)
     return (unsigned)(texel * 256.0);
 }
 
+static uint32_t texture_pixel(const Texture *texture, size_t index)
+{
+    if (texture->format == 1U)
+        return (uint32_t)texture->pixels[index] * UINT32_C(0x01010101);
+    return le32(texture->pixels + index * 4U);
+}
+
 static uint32_t sample(const Texture *texture, double u, double v)
 {
     const unsigned fx = sample_coord(u, texture->width);
     const unsigned fy = sample_coord(v, texture->height);
     const unsigned x = fx >> 8, y = fy >> 8;
-    const uint32_t *row = texture->pixels + (size_t)y * texture->width;
-    uint32_t top = row[x];
+    size_t row = (size_t)y * texture->width;
+    uint32_t top = texture_pixel(texture, row + x);
     if (fx & 255U)
-        top = lerp(top, row[x + 1U], fx & 255U);
+        top = lerp(top, texture_pixel(texture, row + x + 1U), fx & 255U);
     if (fy & 255U) {
         uint32_t bottom;
         row += texture->width;
-        bottom = row[x];
+        bottom = texture_pixel(texture, row + x);
         if (fx & 255U)
-            bottom = lerp(bottom, row[x + 1U], fx & 255U);
+            bottom = lerp(bottom, texture_pixel(texture, row + x + 1U), fx & 255U);
         top = lerp(top, bottom, fy & 255U);
     }
     return top;
@@ -456,7 +543,7 @@ static uint8_t saturate_byte(unsigned value)
     return (uint8_t)(value > 255U ? 255U : value);
 }
 
-static void blend(Bgra *pixel, uint32_t rgba)
+static void blend(Bgr *pixel, uint32_t rgba)
 {
     const unsigned alpha = channel(rgba, 3);
     if (alpha == 255U) {
@@ -471,15 +558,14 @@ static void blend(Bgra *pixel, uint32_t rgba)
     }
 }
 
-static void solid_span(Bgra *pixel, int32_t count, uint32_t rgba)
+static void solid_span(Bgr *pixel, int32_t count, uint32_t rgba)
 {
     int32_t i;
     if (rgba >= 0xff000000UL) {
-        Bgra value;
+        Bgr value;
         value.b = (uint8_t)(rgba >> 16);
         value.g = (uint8_t)(rgba >> 8);
         value.r = (uint8_t)rgba;
-        value.a = 255;
         for (i = 0; i < count; ++i)
             pixel[i] = value;
     } else if (rgba) {
@@ -488,7 +574,7 @@ static void solid_span(Bgra *pixel, int32_t count, uint32_t rgba)
     }
 }
 
-static void triangle(Bgra *surface, uint32_t stride, Clip clip,
+static void triangle(WcSurface *surface, Clip clip,
                      const Texture *texture, const Vertex *a, const Vertex *b,
                      const Vertex *c)
 {
@@ -554,7 +640,9 @@ static void triangle(Bgra *surface, uint32_t stride, Clip clip,
         if (edge_span(&edges[0], &start, &past) &&
             edge_span(&edges[1], &start, &past) &&
             edge_span(&edges[2], &start, &past)) {
-            Bgra *pixel = surface + (size_t)y * stride + (left + start);
+            Bgr *pixel = (Bgr *)(surface->pixels +
+                (size_t)(surface->height - 1U - (uint32_t)y) * surface->stride) +
+                (left + start);
             if (flat_color && flat_uv) {
                 solid_span(pixel, past - start, modulate(flat_texel, a->color));
             } else {
@@ -617,14 +705,15 @@ static void paint_mesh(WcRaster *raster, const Mesh *mesh,
     }
     for (i = 0; i < mesh->index_count; i += 3) {
         const uint8_t *index = mesh->indices + i * 4U;
-        triangle(raster->pixels, width, clip, &raster->textures[slot],
+        triangle(&raster->surface, clip, &raster->textures[slot],
                  raster->vertices + le32(index),
                  raster->vertices + le32(index + 4),
                  raster->vertices + le32(index + 8));
     }
 }
 
-static int reserve_frame(WcRaster *raster, size_t pixels, size_t vertices)
+static int reserve_frame(WcRaster *raster, uint32_t width, uint32_t height,
+                         size_t vertices)
 {
     if (vertices > raster->vertex_capacity) {
         Vertex *replacement = realloc(raster->vertices, vertices * sizeof(Vertex));
@@ -633,14 +722,21 @@ static int reserve_frame(WcRaster *raster, size_t pixels, size_t vertices)
         raster->vertices = replacement;
         raster->vertex_capacity = vertices;
     }
-    if (pixels > raster->pixel_capacity) {
-        Bgra *replacement = realloc(raster->pixels, pixels * sizeof(Bgra));
-        if (!replacement)
-            return 0;
-        raster->pixels = replacement;
-        raster->pixel_capacity = pixels;
+    return wc_surface_resize(&raster->surface, width, height);
+}
+
+static void trim_frame(WcRaster *raster, size_t vertices)
+{
+    const size_t retained = vertices < 4096U ? 4096U : vertices;
+    wc_surface_trim(&raster->surface);
+    if (raster->vertex_capacity / 2U > retained &&
+        (raster->vertex_capacity - retained) * sizeof(Vertex) >= 256UL * 1024UL) {
+        Vertex *replacement = realloc(raster->vertices, retained * sizeof(Vertex));
+        if (replacement) {
+            raster->vertices = replacement;
+            raster->vertex_capacity = retained;
+        }
     }
-    return 1;
 }
 
 WcRaster *wc_raster_create(void)
@@ -655,7 +751,7 @@ void wc_raster_destroy(WcRaster *raster)
         return;
     for (i = 0; i < MAX_TEXTURES; ++i)
         free(raster->textures[i].pixels);
-    free(raster->pixels);
+    wc_surface_destroy(&raster->surface);
     free(raster->vertices);
     free(raster);
 }
@@ -663,18 +759,17 @@ void wc_raster_destroy(WcRaster *raster)
 int wc_raster_frame(WcRaster *raster, uint32_t width, uint32_t height,
                     const void *data, size_t len)
 {
-    static const Bgra backdrop = {240, 240, 240, 255};
     Reader reader, meshes;
     const uint8_t *header, *frees;
     uint32_t set_count, mesh_count, free_count, i;
-    size_t pixel_count, max_vertices = 0, pixel;
+    size_t max_vertices = 0;
     Mesh mesh;
 
     if (!raster)
         return 0;
     raster->error = "Invalid WCG1 frame or display size.";
     if (!data || len < 16 || len > MAX_BYTES ||
-        !dimensions(width, height, &pixel_count))
+        !dimensions(width, height, NULL))
         return 0;
     reader.next = data;
     reader.remaining = len;
@@ -701,15 +796,17 @@ int wc_raster_frame(WcRaster *raster, uint32_t width, uint32_t height,
     frees = take(&reader, (size_t)free_count * 4U);
     if (!frees || reader.remaining)
         goto invalid;
+    raster->error = "Not enough memory for an egui texture.";
+    if (!allocate_uploads(raster, set_count))
+        goto invalid;
     raster->error = "Not enough memory for the WordCraft frame.";
-    if (!reserve_frame(raster, pixel_count, max_vertices))
+    if (!reserve_frame(raster, width, height, max_vertices))
         goto invalid;
 
     /* The packet has been validated and all allocations have succeeded.
      * PM reads the completed pixels on this same thread. */
     apply_uploads(raster, set_count);
-    for (pixel = 0; pixel < pixel_count; ++pixel)
-        raster->pixels[pixel] = backdrop;
+    wc_surface_clear(&raster->surface, 240);
     for (i = 0; i < mesh_count; ++i) {
         /* The same immutable packet was completely checked above. */
         (void)read_mesh(&meshes, &mesh);
@@ -723,8 +820,7 @@ int wc_raster_frame(WcRaster *raster, uint32_t width, uint32_t height,
         }
     }
 
-    raster->width = width;
-    raster->height = height;
+    trim_frame(raster, max_vertices);
     raster->error = NULL;
     return 1;
 
@@ -739,15 +835,31 @@ const uint8_t *wc_raster_pixels(const WcRaster *raster, uint32_t *width,
     if (!raster)
         return NULL;
     if (width)
-        *width = raster->width;
+        *width = raster->surface.width;
     if (height)
-        *height = raster->height;
+        *height = raster->surface.height;
     if (stride)
-        *stride = (size_t)raster->width * 4U;
-    return (const uint8_t *)raster->pixels;
+        *stride = raster->surface.stride;
+    return raster->surface.pixels;
 }
 
 const char *wc_raster_error(const WcRaster *raster)
 {
     return raster && raster->error ? raster->error : "";
+}
+
+void wc_raster_memory(const WcRaster *raster, WcRasterMemory *memory)
+{
+    unsigned i;
+    if (!memory)
+        return;
+    memset(memory, 0, sizeof(*memory));
+    if (!raster)
+        return;
+    memory->surface_bytes = raster->surface.capacity;
+    memory->vertex_bytes = raster->vertex_capacity * sizeof(Vertex);
+    for (i = 0; i < MAX_TEXTURES; ++i)
+        if (raster->textures[i].pixels)
+            memory->texture_bytes += (size_t)raster->textures[i].width *
+                                     raster->textures[i].height * raster->textures[i].format;
 }

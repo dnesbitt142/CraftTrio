@@ -10,6 +10,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
+craft-memory = { path = "../native/rust-memory" }
 deckcraft-engine = { path = "../deck-upstream/crates/engine" }
 deckcraft-ui-egui = { path = "../deck-upstream/crates/ui-egui" }
 egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
@@ -30,7 +31,7 @@ codegen-units = 16
 panic = "abort"
 
 [patch.crates-io]
-krilla = { git = "https://github.com/storytold/craft-libs", rev = "c5a1cbfb5f9049f9270955caffb5bee5997aebf7", version = "=0.8.2" }
+krilla = { path = "../grid-craft-libs/vendor/krilla", version = "=0.8.2" }
 ecolor = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
 emath = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
 epaint = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }

@@ -20,7 +20,7 @@ static WcPmConfig config = {
 #else
     "WordCraft", {"Open a document", "Open a picture", "Open a font", "Open a file"},
     "*.*", ".docx", "WCGUI.LOG", "WCENGINE.LOG",
-    "https://api.github.com/repos/storytold/wordcraft/releases/latest", 0, 0
+    "https://api.github.com/repos/storytold/wordcraft/releases/latest", 0, 1
 #endif
 };
 

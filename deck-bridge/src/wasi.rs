@@ -26,6 +26,7 @@ struct Bridge {
     elapsed_ms: u64,
     repaint_delay_ms: u32,
     draw: Vec<u8>,
+    draw_keep_bytes: usize,
     accessibility: Accessibility,
 }
 
@@ -38,7 +39,8 @@ fn with_app<T>(f: impl FnOnce(&mut Bridge) -> T) -> Option<T> {
 }
 
 fn dimensions(w: i32, h: i32) -> Option<egui::Vec2> {
-    ((1..=MAX_SIDE).contains(&w) && (1..=MAX_SIDE).contains(&h)).then(|| egui::vec2(w as f32, h as f32))
+    ((1..=MAX_SIDE).contains(&w) && (1..=MAX_SIDE).contains(&h))
+        .then(|| egui::vec2(w as f32, h as f32))
 }
 
 #[unsafe(no_mangle)]
@@ -47,15 +49,14 @@ pub extern "C" fn wc_init(w: i32, h: i32) -> i32 {
         return 1;
     }
     APP.with(|state| {
-        let Ok(mut state) = state.try_borrow_mut() else { return 1 };
+        let Ok(mut state) = state.try_borrow_mut() else {
+            return 1;
+        };
         if state.is_some() {
             return 0;
         }
         let files = Files::default();
-        let mut session = Session::new();
-        if let Err(error) = deckcraft_engine::sample::open_sample(&mut session) {
-            eprintln!("DeckCraft could not open its sample presentation: {error}");
-        }
+        let session = Session::with_new();
         let mut services = files.services();
         crate::clipboard::install(&mut services);
         let app = SlideApp::new(session, services);
@@ -75,6 +76,7 @@ pub extern "C" fn wc_init(w: i32, h: i32) -> i32 {
             elapsed_ms: 0,
             repaint_delay_ms: u32::MAX,
             draw: Vec::new(),
+            draw_keep_bytes: 0,
             accessibility: Accessibility::default(),
         });
         0
@@ -83,7 +85,13 @@ pub extern "C" fn wc_init(w: i32, h: i32) -> i32 {
 
 fn modifiers(mask: i32) -> Modifiers {
     let ctrl = mask & 2 != 0;
-    Modifiers { shift: mask & 1 != 0, ctrl, alt: mask & 4 != 0, command: ctrl, mac_cmd: false }
+    Modifiers {
+        shift: mask & 1 != 0,
+        ctrl,
+        alt: mask & 4 != 0,
+        command: ctrl,
+        mac_cmd: false,
+    }
 }
 
 fn key(code: i32) -> Option<Key> {
@@ -139,9 +147,18 @@ pub extern "C" fn wc_event(kind: i32, a: i32, b: i32, c: i32, d: i32) -> i32 {
                 let scale = state.context.pixels_per_point();
                 let pos = egui::pos2(a as f32 / scale, b as f32 / scale);
                 state.events.push(Event::PointerMoved(pos));
-                for (mask, button) in [(1, PointerButton::Primary), (2, PointerButton::Secondary), (4, PointerButton::Middle)] {
+                for (mask, button) in [
+                    (1, PointerButton::Primary),
+                    (2, PointerButton::Secondary),
+                    (4, PointerButton::Middle),
+                ] {
                     if (state.buttons ^ c) & mask != 0 {
-                        state.events.push(Event::PointerButton { pos, button, pressed: c & mask != 0, modifiers: mods });
+                        state.events.push(Event::PointerButton {
+                            pos,
+                            button,
+                            pressed: c & mask != 0,
+                            modifiers: mods,
+                        });
                     }
                 }
                 state.buttons = c & 7;
@@ -178,7 +195,9 @@ pub extern "C" fn wc_event(kind: i32, a: i32, b: i32, c: i32, d: i32) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wc_text(codepoint: u32) -> i32 {
-    let Some(ch) = char::from_u32(codepoint).filter(|ch| !ch.is_control()) else { return 1 };
+    let Some(ch) = char::from_u32(codepoint).filter(|ch| !ch.is_control()) else {
+        return 1;
+    };
     with_app(|state| {
         if state.events.len() >= MAX_EVENTS {
             return 1;
@@ -191,12 +210,16 @@ pub extern "C" fn wc_text(codepoint: u32) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wc_frame(w: i32, h: i32, time_ms: u32) -> i32 {
-    let Some(size) = dimensions(w, h) else { return 1 };
+    let Some(size) = dimensions(w, h) else {
+        return 1;
+    };
     with_app(|state| {
         let previous_scale = state.context.pixels_per_point();
         let screen = Rect::from_min_size(egui::Pos2::ZERO, size / previous_scale);
         if let Some(last_tick) = state.last_tick.replace(time_ms) {
-            state.elapsed_ms = state.elapsed_ms.saturating_add(u64::from(time_ms.wrapping_sub(last_tick)));
+            state.elapsed_ms = state
+                .elapsed_ms
+                .saturating_add(u64::from(time_ms.wrapping_sub(last_tick)));
         }
         let mut input = RawInput {
             screen_rect: Some(screen),
@@ -230,20 +253,34 @@ pub extern "C" fn wc_frame(w: i32, h: i32, time_ms: u32) -> i32 {
         }
         crate::clipboard::output(&frame.platform_output.commands);
         if let Some(root) = frame.viewport_output.get(&egui::ViewportId::ROOT) {
-            state.should_close |= root.commands.iter().any(|command| matches!(command, egui::ViewportCommand::Close));
+            state.should_close |= root
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Close));
         }
         state.repaint_delay_ms = if scale != previous_scale {
             0
         } else {
-            frame.viewport_output.get(&egui::ViewportId::ROOT).and_then(|root| u32::try_from(root.repaint_delay.as_millis()).ok()).unwrap_or(u32::MAX)
+            frame
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .and_then(|root| u32::try_from(root.repaint_delay.as_millis()).ok())
+                .unwrap_or(u32::MAX)
         };
         let primitives = ctx.tessellate(frame.shapes, frame.pixels_per_point);
         let mut textures = frame.textures_delta;
         let screen_pixels = Rect::from_min_size(egui::Pos2::ZERO, size);
-        let packed = pack_draw(&mut state.draw, &textures, &primitives, screen_pixels, scale);
+        let packed = pack_draw(
+            &mut state.draw,
+            &textures,
+            &primitives,
+            screen_pixels,
+            scale,
+        );
         // The PM host receives every delta in the draw packet and owns its application.
         textures.clear();
-        if packed.is_some() {
+        if let Some(keep_bytes) = packed {
+            state.draw_keep_bytes = keep_bytes;
             0
         } else {
             eprintln!("DeckCraft's frame exceeded the Presentation Manager bridge limits.");
@@ -268,14 +305,20 @@ pub extern "C" fn wc_open_requested() -> i32 {
 /// Allocate linear memory for one incoming filename and its contents.
 #[unsafe(no_mangle)]
 pub extern "C" fn wc_reserve_input(len: usize) -> usize {
-    with_app(|state| state.files.reserve_input(len)).flatten().unwrap_or(0)
+    with_app(|state| state.files.reserve_input(len))
+        .flatten()
+        .unwrap_or(0)
 }
 
 /// Deliver the UTF-8 name followed by raw file bytes to DeckCraft's own import queue.
 #[unsafe(no_mangle)]
 pub extern "C" fn wc_accept_input(name_len: usize, data_len: usize) -> i32 {
     with_app(|state| {
-        if state.files.accept_input(name_len, data_len, || state.app.begin_external_file("open")).is_some() {
+        if state
+            .files
+            .accept_input(name_len, data_len, || state.app.begin_external_file("open"))
+            .is_some()
+        {
             state.context.request_repaint();
             0
         } else {
@@ -289,7 +332,14 @@ pub extern "C" fn wc_accept_input(name_len: usize, data_len: usize) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn wc_close_request() -> i32 {
     with_app(|state| {
-        if state.app.quit_confirmed || !state.app.session.documents().iter().any(|document| document.is_dirty()) {
+        if state.app.quit_confirmed
+            || !state
+                .app
+                .session
+                .documents()
+                .iter()
+                .any(|document| document.is_dirty())
+        {
             return 1;
         }
         state.close_pending = true;
@@ -313,6 +363,28 @@ pub extern "C" fn wc_draw_ptr() -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn wc_draw_len() -> usize {
     with_app(|state| state.draw.len()).unwrap_or(0)
+}
+
+/// Called only after the native renderer has consumed this frame. Texture
+/// uploads are one-shot: retain the mesh-sized budget, not the upload peak.
+#[unsafe(no_mangle)]
+pub extern "C" fn wc_draw_consumed() -> i32 {
+    with_app(|state| {
+        craft_memory::buffers::consume_draw(&mut state.draw, state.draw_keep_bytes);
+        0
+    })
+    .unwrap_or(1)
+}
+
+/// Diagnostic capacities only: neither query changes packet storage or pointers.
+#[unsafe(no_mangle)]
+pub extern "C" fn wc_draw_capacity() -> usize {
+    with_app(|state| state.draw.capacity()).unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wc_input_capacity() -> usize {
+    with_app(|state| state.files.input_capacity()).unwrap_or(0)
 }
 
 /// The current native accessibility snapshot remains valid until the next frame.
@@ -341,33 +413,52 @@ fn put_f32(out: &mut Vec<u8>, value: f32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-fn pack_draw(out: &mut Vec<u8>, textures: &egui::TexturesDelta, primitives: &[ClippedPrimitive], screen: Rect, scale: f32) -> Option<()> {
+fn pack_draw(
+    out: &mut Vec<u8>,
+    textures: &egui::TexturesDelta,
+    primitives: &[ClippedPrimitive],
+    screen: Rect,
+    scale: f32,
+) -> Option<usize> {
     let pixels = |pos: egui::Pos2| (pos.to_vec2() * scale).to_pos2();
     let meshes = || {
         primitives.iter().filter_map(|item| {
-            let Primitive::Mesh(mesh) = &item.primitive else { return None };
-            let clip = Rect::from_min_max(pixels(item.clip_rect.min), pixels(item.clip_rect.max)).intersect(screen);
+            let Primitive::Mesh(mesh) = &item.primitive else {
+                return None;
+            };
+            let clip = Rect::from_min_max(pixels(item.clip_rect.min), pixels(item.clip_rect.max))
+                .intersect(screen);
             (clip.is_positive() && !mesh.indices.is_empty()).then_some((mesh, clip))
         })
     };
-    let updates = || textures.set.iter().flat_map(|(id, deltas)| deltas.iter().map(move |delta| (*id, delta)));
+    let updates = || {
+        textures
+            .set
+            .iter()
+            .flat_map(|(id, deltas)| deltas.iter().map(move |delta| (*id, delta)))
+    };
     let mut bytes = 16usize.checked_add(textures.free.len().checked_mul(4)?)?;
+    let mut texture_bytes = 0usize;
     let mut set_count = 0u32;
     for (_, delta) in updates() {
         set_count = set_count.checked_add(1)?;
         let ImageData::Color(image) = &delta.image;
-        bytes = bytes.checked_add(20usize.checked_add(image.pixels.len().checked_mul(4)?)?)?;
+        let upload_bytes = 20usize.checked_add(image.pixels.len().checked_mul(4)?)?;
+        bytes = bytes.checked_add(upload_bytes)?;
+        texture_bytes = texture_bytes.checked_add(upload_bytes)?;
     }
     let mut mesh_count = 0u32;
     for (mesh, _) in meshes() {
-        bytes = bytes.checked_add(28)?.checked_add(mesh.vertices.len().checked_mul(20)?)?.checked_add(mesh.indices.len().checked_mul(4)?)?;
+        bytes = bytes
+            .checked_add(28)?
+            .checked_add(mesh.vertices.len().checked_mul(20)?)?
+            .checked_add(mesh.indices.len().checked_mul(4)?)?;
         mesh_count = mesh_count.checked_add(1)?;
     }
     if bytes > MAX_PACKET {
         return None;
     }
-    out.clear();
-    out.try_reserve(bytes).ok()?;
+    craft_memory::buffers::prepare_draw(out, bytes)?;
     out.extend_from_slice(b"WCG1");
     put_u32(out, set_count);
     put_u32(out, mesh_count);
@@ -406,5 +497,5 @@ fn pack_draw(out: &mut Vec<u8>, textures: &egui::TexturesDelta, primitives: &[Cl
     for id in &textures.free {
         put_u32(out, texture_number(*id)?);
     }
-    Some(())
+    bytes.checked_sub(texture_bytes)
 }

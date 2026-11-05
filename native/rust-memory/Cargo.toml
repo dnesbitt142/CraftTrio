@@ -1,0 +1,9 @@
+[package]
+name = "craft-memory"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Bounded bridge buffers and allocator-aware OS/2 page reclamation"
+
+[lib]
+path = "src/lib.rs"

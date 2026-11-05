@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 20dcf28..04aa314 100644
+index 20dcf28..019cfc2 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -910,12 +910,10 @@ dependencies = [
@@ -15,7 +15,18 @@ index 20dcf28..04aa314 100644
  dependencies = [
   "fixed_decimal",
   "icu_decimal",
-@@ -952,7 +950,6 @@ dependencies = [
+@@ -935,6 +933,10 @@ dependencies = [
+  "writeable",
+ ]
+ 
++[[package]]
++name = "craft-memory"
++version = "0.1.0"
++
+ [[package]]
+ name = "craft-print"
+ version = "0.1.0"
+@@ -952,7 +954,6 @@ dependencies = [
  [[package]]
  name = "craft-ui"
  version = "0.1.0"
@@ -23,7 +34,7 @@ index 20dcf28..04aa314 100644
  dependencies = [
   "craft-fonts-build",
   "craft-i18n",
-@@ -2148,6 +2145,16 @@ dependencies = [
+@@ -2148,6 +2149,17 @@ dependencies = [
   "zbus",
  ]
  
@@ -31,6 +42,7 @@ index 20dcf28..04aa314 100644
 +name = "gridcraft-warp"
 +version = "0.16.0"
 +dependencies = [
++ "craft-memory",
 + "egui",
 + "gridcraft-engine",
 + "gridcraft-ui-egui",
@@ -54,10 +66,10 @@ index 594b292..39861f5 100644
 +craft-i18n = { path = "../grid-craft-libs/crates/i18n" }
 diff --git a/apps/gridcraft-warp/Cargo.toml b/apps/gridcraft-warp/Cargo.toml
 new file mode 100644
-index 0000000..85d9af3
+index 0000000..402916d
 --- /dev/null
 +++ b/apps/gridcraft-warp/Cargo.toml
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,18 @@
 +[package]
 +name = "gridcraft-warp"
 +version.workspace = true
@@ -71,6 +83,7 @@ index 0000000..85d9af3
 +crate-type = ["cdylib"]
 +
 +[dependencies]
++craft-memory = { path = "../../../native/rust-memory" }
 +gridcraft-engine = { workspace = true }
 +gridcraft-ui-egui = { path = "../../crates/ui-egui" }
 +egui = { workspace = true }
@@ -405,7 +418,7 @@ index 0000000..e9375a6
 +}
 diff --git a/apps/gridcraft-warp/src/file_bridge.rs b/apps/gridcraft-warp/src/file_bridge.rs
 new file mode 100644
-index 0000000..eee5a6a
+index 0000000..49e3eff
 --- /dev/null
 +++ b/apps/gridcraft-warp/src/file_bridge.rs
 @@ -0,0 +1,110 @@
@@ -485,46 +498,46 @@ index 0000000..eee5a6a
 +        self.request.replace(0)
 +    }
 +
++    pub(crate) fn input_capacity(&self) -> usize {
++        self.input.capacity()
++    }
++
 +    pub(crate) fn reserve_input(&mut self, len: usize) -> Option<usize> {
-+        if len == 0 || len > MAX_INPUT_BYTES + MAX_PATH_BYTES {
-+            return None;
-+        }
-+        self.input.clear();
-+        self.input.try_reserve_exact(len).ok()?;
-+        self.input.resize(len, 0);
-+        Some(self.input.as_mut_ptr() as usize)
++        craft_memory::buffers::reserve_input(&mut self.input, len, MAX_INPUT_BYTES + MAX_PATH_BYTES)
 +    }
 +
 +    pub(crate) fn accept_input(&mut self, name_len: usize, data_len: usize) -> Option<()> {
++        // The host is done with this pointer. Dropping a rejected/cancelled
++        // request releases its storage; successful input moves into the inbox.
++        let mut input = std::mem::take(&mut self.input);
 +        let picture = self.picture.take();
 +        if name_len == 0 && data_len == 0 {
-+            self.input.clear();
 +            return Some(());
 +        }
-+        if name_len == 0 || name_len > MAX_PATH_BYTES || data_len > MAX_INPUT_BYTES || name_len.checked_add(data_len)? != self.input.len() {
++        if name_len == 0 || name_len > MAX_PATH_BYTES || data_len > MAX_INPUT_BYTES || name_len.checked_add(data_len)? != input.len() {
 +            return None;
 +        }
 +        let mut inbox = picture.as_ref().unwrap_or(&self.inbox).lock().ok()?;
 +        if !inbox.is_empty() {
 +            return None;
 +        }
-+        let name = std::str::from_utf8(self.input.get(..name_len)?).ok()?;
++        let name = std::str::from_utf8(input.get(..name_len)?).ok()?;
 +        if name.contains('\0') {
 +            return None;
 +        }
 +        let name = name.to_owned();
-+        self.input.copy_within(name_len.., 0);
-+        self.input.truncate(data_len);
-+        inbox.push((name, std::mem::take(&mut self.input)));
++        input.copy_within(name_len.., 0);
++        input.truncate(data_len);
++        inbox.push((name, input));
 +        Some(())
 +    }
 +}
 diff --git a/apps/gridcraft-warp/src/lib.rs b/apps/gridcraft-warp/src/lib.rs
 new file mode 100644
-index 0000000..16617b5
+index 0000000..34d3330
 --- /dev/null
 +++ b/apps/gridcraft-warp/src/lib.rs
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,14 @@
 +//! Presentation Manager host bridge for the upstream GridCraft UI.
 +#[cfg(target_os = "wasi")]
 +mod a11y;
@@ -534,12 +547,17 @@ index 0000000..16617b5
 +mod file_bridge;
 +#[cfg(target_os = "wasi")]
 +mod wasi;
++
++// The allocator keeps its page ledger outside reclaimed user allocations.
++#[cfg(target_os = "wasi")]
++#[global_allocator]
++static OS2_ALLOCATOR: craft_memory::ReclaimAllocator = craft_memory::ReclaimAllocator::new();
 diff --git a/apps/gridcraft-warp/src/wasi.rs b/apps/gridcraft-warp/src/wasi.rs
 new file mode 100644
-index 0000000..ab3be9b
+index 0000000..936ee8a
 --- /dev/null
 +++ b/apps/gridcraft-warp/src/wasi.rs
-@@ -0,0 +1,416 @@
+@@ -0,0 +1,443 @@
 +use egui::epaint::{ClippedPrimitive, ImageData, Primitive};
 +use egui::{Context, Event, Key, Modifiers, PointerButton, RawInput, Rect, TextureId};
 +use gridcraft_engine::Session;
@@ -568,6 +586,7 @@ index 0000000..ab3be9b
 +    elapsed_ms: u64,
 +    repaint_delay_ms: u32,
 +    draw: Vec<u8>,
++    draw_keep_bytes: usize,
 +    accessibility: Accessibility,
 +}
 +
@@ -595,7 +614,7 @@ index 0000000..ab3be9b
 +        }
 +        let files = Files::default();
 +        let mut session = Session::new();
-+        let _ = session.execute("file.new", serde_json::json!({"sample": "sales"}));
++        let _ = session.execute("file.new", serde_json::json!({}));
 +        let mut services = files.services();
 +        crate::clipboard::install(&mut services);
 +        let mut app = SheetApp::new(session, services);
@@ -615,6 +634,7 @@ index 0000000..ab3be9b
 +            elapsed_ms: 0,
 +            repaint_delay_ms: u32::MAX,
 +            draw: Vec::new(),
++            draw_keep_bytes: 0,
 +            accessibility: Accessibility::default(),
 +        });
 +        0
@@ -794,7 +814,8 @@ index 0000000..ab3be9b
 +        let packed = pack_draw(&mut state.draw, &textures, &primitives, screen_pixels, scale);
 +        // The PM host receives every delta in the draw packet and owns its application.
 +        textures.clear();
-+        if packed.is_some() {
++        if let Some(keep_bytes) = packed {
++            state.draw_keep_bytes = keep_bytes;
 +            0
 +        } else {
 +            eprintln!("GridCraft's frame exceeded the Presentation Manager bridge limits.");
@@ -863,6 +884,28 @@ index 0000000..ab3be9b
 +    with_app(|state| state.draw.len()).unwrap_or(0)
 +}
 +
++/// Called only after the native renderer has consumed this frame. Texture
++/// uploads are one-shot: retain the mesh-sized budget, not the upload peak.
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_draw_consumed() -> i32 {
++    with_app(|state| {
++        craft_memory::buffers::consume_draw(&mut state.draw, state.draw_keep_bytes);
++        0
++    })
++    .unwrap_or(1)
++}
++
++/// Diagnostic capacities only: neither query changes packet storage or pointers.
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_draw_capacity() -> usize {
++    with_app(|state| state.draw.capacity()).unwrap_or(0)
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_input_capacity() -> usize {
++    with_app(|state| state.files.input_capacity()).unwrap_or(0)
++}
++
 +/// The current native accessibility snapshot remains valid until the next frame.
 +#[unsafe(no_mangle)]
 +pub extern "C" fn wc_a11y_ptr() -> usize {
@@ -889,7 +932,7 @@ index 0000000..ab3be9b
 +    out.extend_from_slice(&value.to_le_bytes());
 +}
 +
-+fn pack_draw(out: &mut Vec<u8>, textures: &egui::TexturesDelta, primitives: &[ClippedPrimitive], screen: Rect, scale: f32) -> Option<()> {
++fn pack_draw(out: &mut Vec<u8>, textures: &egui::TexturesDelta, primitives: &[ClippedPrimitive], screen: Rect, scale: f32) -> Option<usize> {
 +    let pixels = |pos: egui::Pos2| (pos.to_vec2() * scale).to_pos2();
 +    let meshes = || {
 +        primitives.iter().filter_map(|item| {
@@ -900,11 +943,14 @@ index 0000000..ab3be9b
 +    };
 +    let updates = || textures.set.iter().flat_map(|(id, deltas)| deltas.iter().map(move |delta| (*id, delta)));
 +    let mut bytes = 16usize.checked_add(textures.free.len().checked_mul(4)?)?;
++    let mut texture_bytes = 0usize;
 +    let mut set_count = 0u32;
 +    for (_, delta) in updates() {
 +        set_count = set_count.checked_add(1)?;
 +        let ImageData::Color(image) = &delta.image;
-+        bytes = bytes.checked_add(20usize.checked_add(image.pixels.len().checked_mul(4)?)?)?;
++        let upload_bytes = 20usize.checked_add(image.pixels.len().checked_mul(4)?)?;
++        bytes = bytes.checked_add(upload_bytes)?;
++        texture_bytes = texture_bytes.checked_add(upload_bytes)?;
 +    }
 +    let mut mesh_count = 0u32;
 +    for (mesh, _) in meshes() {
@@ -914,8 +960,7 @@ index 0000000..ab3be9b
 +    if bytes > MAX_PACKET {
 +        return None;
 +    }
-+    out.clear();
-+    out.try_reserve(bytes).ok()?;
++    craft_memory::buffers::prepare_draw(out, bytes)?;
 +    out.extend_from_slice(b"WCG1");
 +    put_u32(out, set_count);
 +    put_u32(out, mesh_count);
@@ -954,7 +999,7 @@ index 0000000..ab3be9b
 +    for id in &textures.free {
 +        put_u32(out, texture_number(*id)?);
 +    }
-+    Some(())
++    bytes.checked_sub(texture_bytes)
 +}
 diff --git a/crates/core/Cargo.toml b/crates/core/Cargo.toml
 index e7d3695..e6d34ad 100644
@@ -1033,6 +1078,274 @@ index 6f61b23..16cd1e7 100644
              .map(|n| n.to_string_lossy().to_string())
              .unwrap_or_else(|| self.title.clone())
      }
+diff --git a/crates/pdf/src/lib.rs b/crates/pdf/src/lib.rs
+index 6898382..9033e8e 100644
+--- a/crates/pdf/src/lib.rs
++++ b/crates/pdf/src/lib.rs
+@@ -356,6 +356,7 @@ fn rgb_op(c: Rgb, stroke: bool) -> String {
+ struct ImageData {
+     width: u32,
+     height: u32,
++    // Already encoded: no complete deinterleaved raster is retained.
+     rgb: Vec<u8>,
+     alpha: Option<Vec<u8>>,
+ }
+@@ -653,13 +654,9 @@ impl Page {
+             return;
+         }
+         let px = px as usize;
+-        let mut rgb = Vec::with_capacity(px * 3);
+-        let mut alpha = Vec::with_capacity(px);
+-        for p in rgba.as_chunks::<4>().0.iter().take(px) {
+-            rgb.extend_from_slice(&[p[0], p[1], p[2]]);
+-            alpha.push(p[3]);
+-        }
+-        let alpha = if alpha.iter().all(|a| *a == 255) { None } else { Some(alpha) };
++        let rgb = run_length_by(px * 3, |i| rgba[(i / 3) * 4 + i % 3]);
++        let opaque = rgba.as_chunks::<4>().0.iter().take(px).all(|p| p[3] == 255);
++        let alpha = (!opaque).then(|| run_length_by(px, |i| rgba[i * 4 + 3]));
+         let idx = self.images.len();
+         self.images.push(ImageData { width: pw, height: ph, rgb, alpha });
+         let s = format!("q {} 0 0 {} {} {} cm /Im{} Do Q", n(w), n(h), n(x), n(self.y(y + h)), idx + 1);
+@@ -682,14 +679,17 @@ pub struct PdfDoc {
+     pub info: Info,
+ }
+ 
+-/// PackBits-style run-length encoding (PDF `RunLengthDecode`).
+-fn run_length(data: &[u8]) -> Vec<u8> {
+-    let mut out = Vec::with_capacity(data.len() / 2 + 16);
++/// PackBits-style run-length encoding (PDF `RunLengthDecode`) over a virtual
++/// byte channel. Reading directly from RGBA avoids allocating RGB/alpha copies.
++fn run_length_by(length: usize, byte: impl Fn(usize) -> u8) -> Vec<u8> {
++    // Do not reserve a fraction of the decoded raster: a large solid image
++    // needs very little encoded storage. Grow only with the encoded output.
++    let mut out = Vec::with_capacity(length.min(16 * 1024) + 16);
+     let mut i = 0;
+-    while i < data.len() {
+-        let b = data[i];
++    while i < length {
++        let b = byte(i);
+         let mut run = 1;
+-        while i + run < data.len() && run < 128 && data[i + run] == b {
++        while i + run < length && run < 128 && byte(i + run) == b {
+             run += 1;
+         }
+         if run >= 2 {
+@@ -698,27 +698,72 @@ fn run_length(data: &[u8]) -> Vec<u8> {
+             i += run;
+             continue;
+         }
+-        // Literal run until the next repeat of 3+ or 128 bytes.
+         let start = i;
+         let mut len = 0;
+-        while i < data.len() && len < 128 {
+-            if i + 2 < data.len() && data[i] == data[i + 1] && data[i] == data[i + 2] {
++        while i < length && len < 128 {
++            if i + 2 < length && byte(i) == byte(i + 1) && byte(i) == byte(i + 2) {
+                 break;
+             }
+             i += 1;
+             len += 1;
+         }
+         if len == 0 {
+-            // Next is a repeat; loop will handle it.
+             continue;
+         }
+         out.push((len - 1) as u8);
+-        out.extend_from_slice(&data[start..start + len]);
++        for index in start..start + len {
++            out.push(byte(index));
++        }
+     }
+     out.push(128);
+     out
+ }
+ 
++#[cfg(test)]
++fn run_length(data: &[u8]) -> Vec<u8> {
++    run_length_by(data.len(), |i| data[i])
++}
++
++/// Keep image/content payloads separate from their small PDF headers until
++/// final serialization. Each payload moves here and is freed as it is written,
++/// rather than copied into another complete object-sized vector.
++enum PdfObject {
++    Plain(Vec<u8>),
++    Stream { header: Vec<u8>, data: Vec<u8>, suffix: &'static [u8] },
++}
++
++impl From<Vec<u8>> for PdfObject {
++    fn from(value: Vec<u8>) -> Self {
++        Self::Plain(value)
++    }
++}
++
++impl PdfObject {
++    fn append_to(self, out: &mut Vec<u8>) {
++        match self {
++            Self::Plain(body) => out.extend_from_slice(&body),
++            Self::Stream { header, data, suffix } => {
++                out.extend_from_slice(&header);
++                out.extend_from_slice(&data);
++                out.extend_from_slice(suffix);
++            }
++        }
++    }
++}
++
++#[derive(Default)]
++struct PdfObjects(Vec<(u32, PdfObject)>);
++
++impl PdfObjects {
++    fn push(&mut self, (id, body): (u32, impl Into<PdfObject>)) {
++        self.0.push((id, body.into()));
++    }
++
++    fn stream(&mut self, id: u32, header: Vec<u8>, data: Vec<u8>, suffix: &'static [u8]) {
++        self.0.push((id, PdfObject::Stream { header, data, suffix }));
++    }
++}
++
+ /// Longest Info string written, in characters; longer values are cut on a character boundary.
+ const MAX_INFO_CHARS: usize = 1024;
+ 
+@@ -782,7 +827,7 @@ impl PdfDoc {
+                 next += if i == CID_FONT { 3 } else { 1 };
+             }
+         }
+-        let mut objects: Vec<(u32, Vec<u8>)> = Vec::new();
++        let mut objects = PdfObjects::default();
+         let mut kids = Vec::new();
+         let mut annotations = Vec::new();
+         let page_count = self.pages.len();
+@@ -825,30 +870,27 @@ impl PdfDoc {
+                 page.restore();
+             }
+             let mut xobjects = String::new();
+-            for (k, img) in page.images.iter().enumerate() {
++            for (k, img) in std::mem::take(&mut page.images).into_iter().enumerate() {
+                 let img_id = next;
+                 next += 1;
+-                let smask = match &img.alpha {
+-                    Some(a) => {
++                let smask = match img.alpha {
++                    Some(data) => {
+                         let id = next;
+                         next += 1;
+-                        let data = run_length(a);
+-                        let mut o = format!(
++                        let header = format!(
+                             "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /RunLengthDecode /Length {} >>\nstream\n",
+                             img.width,
+                             img.height,
+                             data.len()
+                         )
+                         .into_bytes();
+-                        o.extend_from_slice(&data);
+-                        o.extend_from_slice(b"\nendstream");
+-                        objects.push((id, o));
++                        objects.stream(id, header, data, b"\nendstream");
+                         format!(" /SMask {id} 0 R")
+                     }
+                     None => String::new(),
+                 };
+-                let data = run_length(&img.rgb);
+-                let mut o = format!(
++                let data = img.rgb;
++                let header = format!(
+                     "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceRGB /BitsPerComponent 8{} /Filter /RunLengthDecode /Length {} >>\nstream\n",
+                     img.width,
+                     img.height,
+@@ -856,19 +898,15 @@ impl PdfDoc {
+                     data.len()
+                 )
+                 .into_bytes();
+-                o.extend_from_slice(&data);
+-                o.extend_from_slice(b"\nendstream");
+-                objects.push((img_id, o));
++                objects.stream(img_id, header, data, b"\nendstream");
+                 let _ = write!(xobjects, "/Im{} {} 0 R ", k + 1, img_id);
+             }
+             let content_id = next;
+             let page_id = next + 1;
+             next += 2;
+             let body = std::mem::take(&mut page.content);
+-            let mut o = format!("<< /Length {} >>\nstream\n", body.len()).into_bytes();
+-            o.extend_from_slice(body.as_bytes());
+-            o.extend_from_slice(b"endstream");
+-            objects.push((content_id, o));
++            let header = format!("<< /Length {} >>\nstream\n", body.len()).into_bytes();
++            objects.stream(content_id, header, body.into_bytes(), b"endstream");
+             let xo = if xobjects.is_empty() { String::new() } else { format!(" /XObject << {xobjects}>>") };
+             let mut link_refs = String::new();
+             for link in std::mem::take(&mut page.links) {
+@@ -924,17 +962,17 @@ impl PdfDoc {
+         }
+         info.push_str(" >>");
+         objects.push((3, info.into_bytes()));
+-        objects.sort_by_key(|(id, _)| *id);
++        objects.0.sort_by_key(|(id, _)| *id);
+ 
+         let mut out: Vec<u8> = Vec::new();
+         out.extend_from_slice(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n");
+         let mut offsets = vec![0usize; next as usize];
+-        for (id, body) in &objects {
+-            if let Some(slot) = offsets.get_mut(*id as usize) {
++        for (id, body) in objects.0 {
++            if let Some(slot) = offsets.get_mut(id as usize) {
+                 *slot = out.len();
+             }
+             out.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+-            out.extend_from_slice(body);
++            body.append_to(&mut out);
+             out.extend_from_slice(b"\nendobj\n");
+         }
+         let xref = out.len();
+diff --git a/crates/pdf/src/tests.rs b/crates/pdf/src/tests.rs
+index 1e7a0ae..76873d0 100644
+--- a/crates/pdf/src/tests.rs
++++ b/crates/pdf/src/tests.rs
+@@ -350,3 +350,40 @@ fn symbol_font_draws_maths_in_its_own_encoding() {
+     assert!(Font::TimesRoman.can_encode('x') && !Font::TimesRoman.can_encode('\u{2211}'));
+     assert_eq!(text_width(Font::Symbol, 10.0, "\u{2211}"), 7.13);
+ }
++
++#[test]
++fn image_channels_are_encoded_before_retaining_the_page() {
++    fn decode(data: &[u8]) -> Vec<u8> {
++        let mut out = Vec::new();
++        let mut i = 0;
++        while let Some(&count) = data.get(i) {
++            i += 1;
++            match count {
++                128 => break,
++                0..=127 => {
++                    let count = count as usize + 1;
++                    out.extend_from_slice(&data[i..i + count]);
++                    i += count;
++                }
++                _ => {
++                    out.extend(std::iter::repeat_n(data[i], 257 - count as usize));
++                    i += 1;
++                }
++            }
++        }
++        out
++    }
++    let mut doc = PdfDoc::new();
++    let page = doc.add_page(100.0, 100.0);
++    let pixels = [10, 20, 30, 128, 40, 50, 60, 255];
++    page.image_rgba(Rect::new(0.0, 0.0, 100.0, 100.0), &pixels, [2, 1]);
++    let stored = &page.images[0];
++    assert_eq!(decode(&stored.rgb), [10, 20, 30, 40, 50, 60]);
++    assert_eq!(decode(stored.alpha.as_ref().unwrap()), [128, 255]);
++
++    let large = vec![255; 1024 * 1024 * 4];
++    page.image_rgba(Rect::new(0.0, 0.0, 100.0, 100.0), &large, [1024, 1024]);
++    let stored = &page.images[1];
++    assert!(stored.alpha.is_none(), "opaque images must not retain an alpha raster");
++    assert!(stored.rgb.capacity() < large.len() / 8, "store compressed data instead of a full RGB copy");
++}
 diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
 index 297f7ba..3b2e078 100644
 --- a/crates/ui-egui/Cargo.toml

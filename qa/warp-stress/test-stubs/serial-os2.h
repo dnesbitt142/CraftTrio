@@ -1,0 +1,47 @@
+#ifndef SERIAL_OS2_TEST_H
+#define SERIAL_OS2_TEST_H
+#include <stdint.h>
+typedef unsigned long ULONG, APIRET, HFILE;
+typedef unsigned short USHORT;
+typedef void *PVOID;
+typedef ULONG *PULONG;
+#define QSV_MS_COUNT 14
+#define FILE_NORMAL 0
+#define OPEN_ACTION_FAIL_IF_NEW 0
+#define OPEN_ACTION_OPEN_IF_EXISTS 1
+#define OPEN_ACTION_FAIL_IF_EXISTS 0
+#define OPEN_ACTION_CREATE_IF_NEW 16
+#define OPEN_ACCESS_READWRITE 2
+#define OPEN_ACCESS_WRITEONLY 1
+#define OPEN_SHARE_DENYNONE 64
+#define OPEN_SHARE_DENYREADWRITE 16
+#define OPEN_FLAGS_NOINHERIT 128
+#define ERROR_FILE_EXISTS 80
+#define ERROR_OPEN_FAILED 110
+#define ERROR_TOO_MANY_OPEN_FILES 4
+#define FIL_STANDARD 1
+#define IOCTL_ASYNC 1
+#define ASYNC_SETBAUDRATE 0x41
+#define ASYNC_SETLINECTRL 0x42
+#define ASYNC_EXTSETBAUDRATE 0x43
+#define ASYNC_SETDCBINFO 0x53
+#define ASYNC_GETDCBINFO 0x73
+#define MODE_DTR_CONTROL 1
+#define MODE_RTS_CONTROL 64
+#define MODE_WAIT_READ_TIMEOUT 4
+typedef struct {
+ USHORT usWriteTimeout,usReadTimeout;
+ unsigned char fbCtlHndShake,fbFlowReplace,fbTimeout,bErrorReplacementChar;
+ unsigned char bBreakReplacementChar,bXONChar,bXOFFChar;
+} DCBINFO;
+typedef struct { ULONG cbFile; } FILESTATUS3;
+APIRET DosOpen(const char*,HFILE*,PULONG,ULONG,ULONG,ULONG,ULONG,PVOID);
+APIRET DosDevIOCtl(HFILE,ULONG,ULONG,PVOID,ULONG,PULONG,PVOID,ULONG,PULONG);
+APIRET DosRead(HFILE,PVOID,ULONG,PULONG);
+APIRET DosWrite(HFILE,PVOID,ULONG,PULONG);
+APIRET DosClose(HFILE);
+APIRET DosSleep(ULONG);
+APIRET DosQuerySysInfo(ULONG,ULONG,PVOID,ULONG);
+APIRET DosQueryPathInfo(const char*,ULONG,PVOID,ULONG);
+int seragent_test_system(const char*);
+#endif

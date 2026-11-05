@@ -15,9 +15,17 @@ void wc_raster_destroy(WcRaster *raster);
 int wc_raster_frame(WcRaster *raster, uint32_t width, uint32_t height,
                     const void *data, size_t len);
 
-/* BGRA32, opaque, with the top row first. Valid until the next frame or destroy. */
+/* Bottom-up BGR24 with zeroed padding to a four-byte row boundary, ready for
+ * GpiDrawBits. Valid until the next successful frame or destroy. */
 const uint8_t *wc_raster_pixels(const WcRaster *raster, uint32_t *width,
                                 uint32_t *height, size_t *stride);
 const char *wc_raster_error(const WcRaster *raster);
+
+typedef struct WcRasterMemory {
+    size_t surface_bytes, vertex_bytes, texture_bytes;
+} WcRasterMemory;
+
+/* Allocated capacities, excluding the small renderer metadata structure. */
+void wc_raster_memory(const WcRaster *raster, WcRasterMemory *memory);
 
 #endif

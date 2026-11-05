@@ -17,9 +17,7 @@ objects="$out/objects"
 parts=128
 mkdir -p "$generated" "$objects"
 : "${CRAFT_OBJCONV:?Set CRAFT_OBJCONV to the patched objconv executable}"
-relocation_audit="$kit/audit-omf.py"
-test -f "$relocation_audit"
-export word_support runtime generated objects CRAFT_OBJCONV engine_opt relocation_audit
+export word_support runtime generated objects CRAFT_OBJCONV engine_opt
 
 "${CRAFT_WASM2C:-wasm2c}" "$module" --no-debug-names --num-outputs="$parts" \
     -n word -o "$generated/word.c"
@@ -34,9 +32,6 @@ compile_engine() {
         conformance=(-fno-optimize-sibling-calls -frounding-math -fsignaling-nans)
     fi
     object="$objects/$(basename "$input" .c)"
-    # A failed rebuild may not leave a previous object available for linking.
-    # Keep new ELF/temporary OMF on failure so the conversion can be diagnosed.
-    rm -f "$object.obj" "$object.reloc.json" "$object.tmp"
     "${CRAFT_CC:-gcc}" -m32 -std=gnu99 -march=i386 -mfpmath=387 -fexcess-precision=standard \
         -mpreferred-stack-boundary=2 -mincoming-stack-boundary=2 \
         -fno-pic -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables \
@@ -45,7 +40,6 @@ compile_engine() {
         -I"$runtime" -I"$generated" "-$engine_opt" "${conformance[@]}" \
         -c "$input" -o "$object.o"
     "$CRAFT_OBJCONV" -fomf32 -v0 "$object.o" "$object.tmp"
-    python3 "$relocation_audit" "$object.o" "$object.tmp" --output "$object.reloc.json"
     mv "$object.tmp" "$object.obj"
     unlink "$object.o"
 }

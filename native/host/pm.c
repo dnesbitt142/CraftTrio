@@ -17,14 +17,9 @@
 #include "clipboard.h"
 #include "rng.h"
 
-/* Keep control messages away from common dialog/extension message values.
- * The instance tokens below, rather than the numbers alone, identify our
- * requests when a modal dialog dispatches messages to its owner. */
-#define WM_WCG_START (WM_USER + 0x5a0)
-#define WM_WCG_PICK_INPUT (WM_USER + 0x5a1)
+#define WM_WCG_START (WM_USER + 1)
+#define WM_WCG_PICK_INPUT (WM_USER + 3)
 #define POINTER_TIMER 1
-#define FRAME_TIMER 2
-#define FRAME_WAKE_MS 16U
 #define MAX_VIEW_WIDTH 2560
 #define MAX_VIEW_HEIGHT 1600
 #define MAX_DRAW_PACKET (48UL * 1024 * 1024)
@@ -42,9 +37,6 @@ static struct App {
     uint32_t buttons;
     uint16_t keys[256];
     int inside, busy, ready, failed, needs_frame, repaint_scheduled;
-    int start_attempted;
-    int rendering, frame_timer_armed, frame_timer_reported;
-    uint32_t frame_timer_at;
     int pointer_x, pointer_y, pointer_modifier_mask;
     int reported_draw_error;
     unsigned long frames;
@@ -56,8 +48,6 @@ static struct App {
 static const WcPmConfig *app_config;
 static const WcPmEngine *app_engine;
 static int app_started;
-static const char start_message_token = 'S';
-static const char input_message_token = 'I';
 
 const WcPmConfig *wc_pm_config(void)
 {
@@ -84,21 +74,11 @@ static void log_line(const char *stage, const char *detail)
     }
 }
 
-/* FRAME_TIMER is periodic in PM but consumed as a one-shot. Disarm before
- * rendering so a nested modal loop cannot repeatedly wake a busy engine. */
-static void cancel_frame_wake(void)
-{
-    if (!app.frame_timer_armed) return;
-    app.frame_timer_armed = 0;
-    if (app.client) WinStopTimer(app.anchor, app.client, FRAME_TIMER);
-}
-
 static void fail(const char *stage, const char *detail)
 {
     char message[512];
     if (app.failed) return;
     app.failed = 1;
-    cancel_frame_wake();
     (void)wc_print_finish(1);
     log_line(stage, detail);
     if (app.client) WinStopTimer(app.anchor, app.client, POINTER_TIMER);
@@ -150,36 +130,10 @@ static int dimensions(HWND window, int32_t *size)
     return 1;
 }
 
-/* Coalesce explicit input/resize/startup requests into one short low-priority
- * PM timer. Egui-only repaint deadlines remain on the original 250 ms timer,
- * preserving its idle animation cadence and avoiding extra idle timer wakes. */
-static void schedule_frame_wake(void)
-{
-    uint32_t target;
-    if (!app.ready || app.failed || app.busy || app.rendering || !app.client) return;
-    if (!WinIsWindowShowing(app.client) || !app.needs_frame) {
-        cancel_frame_wake();
-        return;
-    }
-    target = ticks() + FRAME_WAKE_MS;
-    if (app.frame_timer_armed && (int32_t)(target - app.frame_timer_at) >= 0) return;
-    cancel_frame_wake();
-    /* Claim before PM can reenter; further input cannot postpone this wake. */
-    app.frame_timer_at = target;
-    app.frame_timer_armed = 1;
-    if (!WinStartTimer(app.anchor, app.client, FRAME_TIMER, FRAME_WAKE_MS)) {
-        app.frame_timer_armed = 0;
-        if (!app.frame_timer_reported) {
-            log_line("Fast frame timer", "unavailable; using the 250 ms fallback");
-            app.frame_timer_reported = 1;
-        }
-    }
-}
-
 static void request_frame(void)
 {
+    /* A low-priority PM timer drains queued keyboard and mouse input first. */
     app.needs_frame = 1;
-    schedule_frame_wake();
 }
 
 static void input_error(const char *message)
@@ -272,8 +226,7 @@ static void after_frame(HWND window)
     if (error) { fail("Could not check the file request", error); return; }
     if (result) {
         if (result > 4) { fail("Could not open the file picker", "Unknown file request"); return; }
-        if (!WinPostMsg(window, WM_WCG_PICK_INPUT, MPFROMLONG(result),
-                        MPFROMP(&input_message_token))) {
+        if (!WinPostMsg(window, WM_WCG_PICK_INPUT, MPFROMLONG(result), 0)) {
             input_error("Could not open the file picker.");
             cancel_input();
         }
@@ -310,7 +263,7 @@ static int update_bitmap_geometry(void)
     return 1;
 }
 
-static void render_frame_contents(HWND window)
+static void render_frame(HWND window)
 {
     int32_t args[3];
     const char *error;
@@ -406,23 +359,6 @@ static void render_frame_contents(HWND window)
             wc_a11y_update(memory + offset, length);
     }
     after_frame(window);
-}
-
-static void render_frame(HWND window)
-{
-    if (app.rendering || !app.ready || app.failed || app.busy) return;
-    app.rendering = 1;
-    render_frame_contents(window);
-    app.rendering = 0;
-    schedule_frame_wake();
-}
-
-static void frame_wake(HWND window)
-{
-    if (window != app.client || !app.frame_timer_armed ||
-        (int32_t)(ticks() - app.frame_timer_at) < 0) return;
-    cancel_frame_wake();
-    render_frame(window);
 }
 
 static void paint(HWND window)
@@ -648,12 +584,6 @@ static void start(HWND window)
     int32_t size[2];
     uint32_t status;
     const char *error;
-    /* WinFileDlg and message boxes run nested PM loops. A duplicate startup
-     * message must never re-enter the engine, including while it is saving
-     * or displaying an initialization error. Claim the attempt before any
-     * call that could dispatch another window message. */
-    if (app.start_attempted || app.ready || app.busy || app.failed) return;
-    app.start_attempted = 1;
     if (!dimensions(window, size)) { fail("Could not start the application", "The client window has no size"); return; }
     log_line("Initializing native random source", "jitterentropy 3.7.0, OSR 3, health tests enabled");
     error = wc_rng_prepare();
@@ -696,16 +626,8 @@ static MRESULT EXPENTRY client_proc(HWND window, ULONG msg, MPARAM mp1, MPARAM m
     int delta;
     MRESULT result;
     switch (msg) {
-    case WM_WCG_START:
-        if (window == app.client && mp1 == MPFROMP(&start_message_token) &&
-            mp2 == MPFROMP(&app)) { start(window); return 0; }
-        break;
-    case WM_WCG_PICK_INPUT:
-        if (window == app.client && mp2 == MPFROMP(&input_message_token)) {
-            pick_input((uint32_t)mp1);
-            return 0;
-        }
-        break;
+    case WM_WCG_START: start(window); return 0;
+    case WM_WCG_PICK_INPUT: pick_input((uint32_t)mp1); return 0;
     case WM_PAINT: paint(window); return 0;
     case WM_ERASEBACKGROUND: return MRFROMSHORT(TRUE);
     case WM_SIZE:
@@ -749,9 +671,7 @@ static MRESULT EXPENTRY client_proc(HWND window, ULONG msg, MPARAM mp1, MPARAM m
         send_event(5, SHORT1FROMMP(mp2) != 0, 0, 0, 0);
         break;
     case WM_TIMER:
-        if (SHORT1FROMMP(mp1) == FRAME_TIMER) {
-            frame_wake(window);
-        } else if (SHORT1FROMMP(mp1) == POINTER_TIMER) {
+        if (SHORT1FROMMP(mp1) == POINTER_TIMER) {
             check_pointer(window);
             if (wc_network_ready()) request_frame();
             render_frame(window);
@@ -801,8 +721,7 @@ static int run_app(const WcPmConfig *config, const WcPmEngine *engine)
         goto done;
     }
     WinSetFocus(HWND_DESKTOP, app.client);
-    if (!WinPostMsg(app.client, WM_WCG_START, MPFROMP(&start_message_token),
-                    MPFROMP(&app))) {
+    if (!WinPostMsg(app.client, WM_WCG_START, 0, 0)) {
         log_line("Could not post application startup", NULL);
         goto done;
     }
@@ -811,7 +730,6 @@ static int run_app(const WcPmConfig *config, const WcPmEngine *engine)
     exit_code = app.failed ? 1 : 0;
 done:
     app.ready = 0;
-    cancel_frame_wake();
     if (app.client) WinStopTimer(app.anchor, app.client, POINTER_TIMER);
     wc_a11y_shutdown();
     wc_network_shutdown();

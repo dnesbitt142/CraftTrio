@@ -278,6 +278,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-memory"
+version = "0.1.0"
+
+[[package]]
 name = "craft-pdf"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=c5a1cbfb5f9049f9270955caffb5bee5997aebf7#c5a1cbfb5f9049f9270955caffb5bee5997aebf7"
@@ -654,6 +658,7 @@ dependencies = [
 name = "deckcraft-warp"
 version = "0.15.0"
 dependencies = [
+ "craft-memory",
  "deckcraft-engine",
  "deckcraft-ui-egui",
  "egui",
@@ -1456,7 +1461,6 @@ dependencies = [
 [[package]]
 name = "krilla"
 version = "0.8.2"
-source = "git+https://github.com/storytold/craft-libs?rev=c5a1cbfb5f9049f9270955caffb5bee5997aebf7#c5a1cbfb5f9049f9270955caffb5bee5997aebf7"
 dependencies = [
  "base64 0.22.1",
  "bumpalo",

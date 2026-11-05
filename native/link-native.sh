@@ -23,7 +23,7 @@ compile() {
 
 cd "$build"
 if [[ $app = host ]]; then
-    common=(pm raster gui_files guest_services rng a11y clipboard gui_print network)
+    common=(pm raster surface input gui_files guest_services rng a11y clipboard gui_print network)
     for unit in "${common[@]}"; do compile "$kit/host/$unit.c" -bd; done
     # Timing jitter is invalid if the compiler optimizes its measured loops.
     # -od overrides the common host's -ot for every upstream library unit.

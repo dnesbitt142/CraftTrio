@@ -342,7 +342,7 @@ void wasm_rt_allocate_memory(wasm_rt_memory_t* memory,
         report_memory_error("DosSetMem", rc, (ULONG)byte_length);
         wasm_rt_trap(WASM_RT_TRAP_EXHAUSTION);
       }
-      /* Fresh OS/2 private pages are zero-filled on demand. Do not prefault them. */
+      memset(address, 0, (size_t)byte_length);
     }
   }
   memory->data = address;
@@ -387,7 +387,7 @@ static uint64_t grow_memory_impl(wasm_rt_memory_t* memory, uint64_t delta) {
     report_memory_error("DosSetMem", rc, (ULONG)delta_size);
     return (uint64_t)-1;
   }
-  /* This unused suffix is zero-filled on first access by the OS/2 pager. */
+  memset(new_data + old_size, 0, (size_t)delta_size);
 #elif WASM_RT_USE_MMAP
   uint8_t* new_data = memory->data;
   int ret = os_mprotect(new_data + old_size, delta_size);

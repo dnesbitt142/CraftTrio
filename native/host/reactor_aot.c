@@ -41,6 +41,13 @@ uint8_t *wc_reactor_memory(size_t *size)
     return memory->data;
 }
 
+u32 w2c_wc__host_memory_pages(struct w2c_wc__host *context, u32 operation,
+                              u32 offset, u32 length)
+{
+    (void)context;
+    return wasm_rt_memory_pages(w2c_word_memory(&engine), operation, offset, length);
+}
+
 const char *wc_reactor_call(WcOperation op, const int32_t *a, uint32_t *result)
 {
     wasm_rt_trap_t trap;
@@ -63,6 +70,12 @@ const char *wc_reactor_call(WcOperation op, const int32_t *a, uint32_t *result)
     case WCR_A11Y_PTR: *result = w2c_word_wc_a11y_ptr(&engine); break;
     case WCR_A11Y_LEN: *result = w2c_word_wc_a11y_len(&engine); break;
     case WCR_REPAINT_DELAY: *result = w2c_word_wc_repaint_delay_ms(&engine); break;
+    case WCR_CAPABILITIES: *result = WC_ENGINE_DRAW_CONSUMED | WC_ENGINE_MEMORY_STATS; break;
+    case WCR_DRAW_CONSUMED: *result = w2c_word_wc_draw_consumed(&engine); break;
+    case WCR_MEMORY_COMMITTED:
+        *result = (uint32_t)wasm_rt_committed_memory_bytes(w2c_word_memory(&engine)); break;
+    case WCR_MEMORY_RECLAIMED:
+        *result = (uint32_t)wasm_rt_reclaimed_memory_bytes(w2c_word_memory(&engine)); break;
     default: return "Unknown application engine operation";
     }
     return NULL;

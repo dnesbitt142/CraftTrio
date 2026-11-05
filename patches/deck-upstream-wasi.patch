@@ -1,3 +1,28 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index c86df35..191b9dc 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2708,7 +2708,6 @@ dependencies = [
+ [[package]]
+ name = "krilla"
+ version = "0.8.2"
+-source = "git+https://github.com/storytold/craft-libs?rev=c5a1cbfb5f9049f9270955caffb5bee5997aebf7#c5a1cbfb5f9049f9270955caffb5bee5997aebf7"
+ dependencies = [
+  "base64 0.22.1",
+  "bumpalo",
+diff --git a/Cargo.toml b/Cargo.toml
+index ab2b742..18a47e6 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -109,7 +109,7 @@ codegen-units = 16
+ debug = 0
+ 
+ [patch.crates-io]
+-krilla = { git = "https://github.com/storytold/craft-libs", rev = "c5a1cbfb5f9049f9270955caffb5bee5997aebf7", version = "=0.8.2" }
++krilla = { path = "../grid-craft-libs/vendor/krilla", version = "=0.8.2" }
+ ecolor = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+ emath = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+ epaint = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
 diff --git a/crates/engine/Cargo.toml b/crates/engine/Cargo.toml
 index cb1f4c2..cfc9e38 100644
 --- a/crates/engine/Cargo.toml
@@ -107,10 +132,29 @@ index d8c9f23..ba09eac 100644
              h.write_u128(d.as_nanos());
          }
 diff --git a/crates/pdf/src/lib.rs b/crates/pdf/src/lib.rs
-index 6baeda3..15c9ec0 100644
+index 6baeda3..5f467d5 100644
 --- a/crates/pdf/src/lib.rs
 +++ b/crates/pdf/src/lib.rs
-@@ -463,7 +463,11 @@ fn fill_clear(front: &mut [u8], back: &[u8]) {
+@@ -79,6 +79,10 @@ pub struct PdfOptions {
+     pub title: Option<String>,
+     /// Handout/notes page size in points (default US Letter portrait; see [`paper_size`]).
+     pub paper: (f64, f64),
++    /// Do not keep a second decoded backdrop raster solely for cache lookup.
++    /// The PDF writer still deduplicates identical image resources. Enabled
++    /// by default on WASI, where the native OS/2 host has a bounded arena.
++    pub low_memory: bool,
+ }
+ 
+ impl Default for PdfOptions {
+@@ -92,6 +96,7 @@ impl Default for PdfOptions {
+             frame_slides: true,
+             title: None,
+             paper: (612.0, 792.0),
++            low_memory: cfg!(target_os = "wasi"),
+         }
+     }
+ }
+@@ -463,7 +468,11 @@ fn fill_clear(front: &mut [u8], back: &[u8]) {
  }
  
  /// Most bytes of opaque backdrop rasters kept to recognise a backdrop seen before.
@@ -122,6 +166,68 @@ index 6baeda3..15c9ec0 100644
  
  /// Backdrops already handed to the writer, most recent first, with their pixels. Slides that
  /// share a layout render the same backdrop; reusing its image skips hashing and compressing the
+@@ -472,9 +481,15 @@ const BACKDROP_CACHE_BYTES: usize = 32 << 20;
+ struct Backdrops(Vec<(Vec<u8>, u32, u32, Image)>);
+ 
+ impl Backdrops {
+-    fn image(&mut self, mut img: deckcraft_render::Image) -> Image {
++    fn image(&mut self, mut img: deckcraft_render::Image, low_memory: bool) -> Image {
+         opaque(&mut img.pixels);
+         let (w, h) = (img.width, img.height);
++        if low_memory {
++            // Image construction compresses synchronously without the native
++            // rayon feature. Move the raster into the writer instead of also
++            // retaining a full pixel clone for this export-local cache.
++            return Image::from_rgba8(img.pixels, w, h);
++        }
+         if let Some(i) = self.0.iter().position(|(px, pw, ph, _)| (*pw, *ph) == (w, h) && *px == img.pixels) {
+             let hit = self.0.remove(i);
+             let image = hit.3.clone();
+@@ -542,7 +557,7 @@ impl Exporter<'_> {
+                 fill_clear(&mut rgba, &back.pixels);
+                 straight(&mut rgba);
+             }
+-            s.draw_image(self.backdrops.image(back), size);
++            s.draw_image(self.backdrops.image(back, self.opts.low_memory), size);
+             if content {
+                 s.draw_image(Image::from_rgba8(rgba, w, h), size);
+             }
+diff --git a/crates/pdf/src/tests.rs b/crates/pdf/src/tests.rs
+index b34e963..0d7fe0c 100644
+--- a/crates/pdf/src/tests.rs
++++ b/crates/pdf/src/tests.rs
+@@ -61,6 +61,31 @@ fn empty_range_is_an_error() {
+     assert!(matches!(export(&p, &o), Err(PdfError::NoPages)));
+ }
+ 
++#[test]
++fn low_memory_export_keeps_pdf_bytes_and_no_raw_backdrop_cache() {
++    let p = deck(3);
++    for layout in [PageLayout::Slides, PageLayout::Notes, PageLayout::Handouts { per_page: 3 }] {
++        let normal = export(&p, &PdfOptions { low_memory: false, ..opts(layout) }).expect("normal export");
++        let compact = export(&p, &PdfOptions { low_memory: true, ..opts(layout) }).expect("low-memory export");
++        assert_eq!(compact, normal, "{layout:?}: pixel/resource/text output must not change");
++    }
++
++    let image = || {
++        deckcraft_render::render_slide_part(
++            &p,
++            0,
++            deckcraft_render::SlidePart::Backdrop,
++            &RenderOpts { scale: 0.25, threads: 1, ..Default::default() },
++        )
++    };
++    let mut backdrops = super::Backdrops::default();
++    let _ = backdrops.image(image(), true);
++    let _ = backdrops.image(image(), true);
++    assert!(backdrops.0.is_empty(), "low-memory mode must not retain duplicate decoded rasters");
++    let _ = backdrops.image(image(), false);
++    assert!(!backdrops.0.is_empty(), "comparison mode exercises the previous pixel cache");
++}
++
+ #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+ #[cfg_attr(not(target_arch = "wasm32"), test)]
+ fn hidden_slides_skipped_unless_asked() {
 diff --git a/crates/ui-egui/src/app/files.rs b/crates/ui-egui/src/app/files.rs
 index 1e846e0..45e0135 100644
 --- a/crates/ui-egui/src/app/files.rs

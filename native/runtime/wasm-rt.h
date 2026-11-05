@@ -416,6 +416,15 @@ uint64_t wasm_rt_grow_memory(wasm_rt_memory_t*, uint64_t pages);
  */
 void wasm_rt_free_memory(wasm_rt_memory_t*);
 
+/* Craft OS/2 allocator-owned 4 KiB user-page operations. Logical memory size
+ * and base address never change. Register=0, commit=1, decommit=2, unregister=3.
+ * Only the page allocator may register ranges, while their System allocations
+ * remain owned. Nonzero return means no successful state transition. */
+uint32_t wasm_rt_memory_pages(wasm_rt_memory_t*, uint32_t operation,
+                              uint32_t offset, uint32_t length);
+uint64_t wasm_rt_reclaimed_memory_bytes(const wasm_rt_memory_t*);
+uint64_t wasm_rt_committed_memory_bytes(const wasm_rt_memory_t*);
+
 /**
  * Initialize a funcref Table object with an element count of `elements` and a
  * maximum size of `max_elements`.

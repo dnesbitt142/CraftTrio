@@ -54,14 +54,12 @@ static int choose_path(char *path, int save, const char *title, const char *sugg
 }
 
 int wc_gui_pick_input(uint32_t kind, char path[WC_GUI_PATH_CAP],
-                      unsigned char **data, uint32_t *size)
+                      WcInput **input, uint32_t *size)
 {
-    const char *title;
+    const char *title, *error;
     FILESTATUS3 info;
-    FILE *input;
-    int picked, closed, trailing;
-    size_t got;
-    *data = NULL;
+    int picked;
+    *input = NULL;
     *size = 0;
     if (kind < 1 || kind > 4) return -1;
     title = wc_pm_config()->open_titles[kind - 1];
@@ -72,27 +70,16 @@ int wc_gui_pick_input(uint32_t kind, char path[WC_GUI_PATH_CAP],
         file_error("Choose a readable file no larger than 16 MiB.");
         return -1;
     }
-    input = fopen(path, "rb");
-    if (!input) { file_error("Could not open the selected file."); return -1; }
-    *data = malloc(info.cbFile ? info.cbFile : 1);
-    if (!*data) {
-        fclose(input);
-        file_error("Not enough memory to open the selected file.");
-        return -1;
-    }
-    got = fread(*data, 1, info.cbFile, input);
-    trailing = fgetc(input);
-    closed = !ferror(input);
-    if (fclose(input) != 0) closed = 0;
-    if (!closed || got != info.cbFile || trailing != EOF) {
-        free(*data);
-        *data = NULL;
-        file_error("Could not read the whole file.");
-        return -1;
-    }
-    *size = (uint32_t)got;
-    if (kind == 1) strcpy(last_opened, path);
+    error = wc_input_open(path, (uint32_t)info.cbFile, input);
+    if (error) { file_error(error); return -1; }
+    *size = (uint32_t)info.cbFile;
     return 1;
+}
+
+void wc_gui_input_accepted(uint32_t kind, const char *path)
+{
+    if (kind == 1 && path && strlen(path) < sizeof(last_opened))
+        strcpy(last_opened, path);
 }
 
 static const char *basename_of(const char *path)

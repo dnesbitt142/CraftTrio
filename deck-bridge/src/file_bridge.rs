@@ -10,13 +10,31 @@ const MAX_INPUT_BYTES: usize = 16 << 20;
 #[link(wasm_import_module = "wc_host")]
 unsafe extern "C" {
     #[link_name = "save"]
-    fn native_save(name: *const u8, name_len: usize, data: *const u8, data_len: usize, save_as: i32, path: *mut u8, path_cap: usize) -> i32;
+    fn native_save(
+        name: *const u8,
+        name_len: usize,
+        data: *const u8,
+        data_len: usize,
+        save_as: i32,
+        path: *mut u8,
+        path_cap: usize,
+    ) -> i32;
 }
 
 fn save(name: &str, data: &[u8], save_as: bool) -> Result<Option<String>, String> {
     let mut path = [0u8; MAX_PATH_BYTES];
     // The host validates both slices and writes at most the capacity of the output buffer.
-    let result = unsafe { native_save(name.as_ptr(), name.len(), data.as_ptr(), data.len(), i32::from(save_as), path.as_mut_ptr(), path.len()) };
+    let result = unsafe {
+        native_save(
+            name.as_ptr(),
+            name.len(),
+            data.as_ptr(),
+            data.len(),
+            i32::from(save_as),
+            path.as_mut_ptr(),
+            path.len(),
+        )
+    };
     match result {
         -1 => Ok(None),
         0 => Ok(Some(name.to_owned())),
@@ -65,7 +83,9 @@ impl Files {
     }
 
     pub(crate) fn take_request(&mut self) -> i32 {
-        let Some((kind, id)) = self.request.take() else { return 0 };
+        let Some((kind, id)) = self.request.take() else {
+            return 0;
+        };
         if let Some(id) = self.active.replace(id)
             && let Ok(mut inbox) = self.inbox.lock()
         {
@@ -74,34 +94,50 @@ impl Files {
         kind
     }
 
-    pub(crate) fn reserve_input(&mut self, len: usize) -> Option<usize> {
-        if len == 0 || len > MAX_INPUT_BYTES + MAX_PATH_BYTES {
-            return None;
-        }
-        self.input.clear();
-        self.input.try_reserve_exact(len).ok()?;
-        self.input.resize(len, 0);
-        Some(self.input.as_mut_ptr() as usize)
+    pub(crate) fn input_capacity(&self) -> usize {
+        self.input.capacity()
     }
 
-    pub(crate) fn accept_input(&mut self, name_len: usize, data_len: usize, direct_open: impl FnOnce() -> u64) -> Option<()> {
+    pub(crate) fn reserve_input(&mut self, len: usize) -> Option<usize> {
+        craft_memory::buffers::reserve_input(&mut self.input, len, MAX_INPUT_BYTES + MAX_PATH_BYTES)
+    }
+
+    pub(crate) fn accept_input(
+        &mut self,
+        name_len: usize,
+        data_len: usize,
+        direct_open: impl FnOnce() -> u64,
+    ) -> Option<()> {
+        // The host is done with this pointer. Dropping a rejected/cancelled
+        // request releases its storage; successful input moves into the inbox.
+        let mut input = std::mem::take(&mut self.input);
         let mut inbox = self.inbox.lock().ok()?;
         if name_len == 0 && data_len == 0 {
-            inbox.push(InboxEvent::Cancelled { id: self.active.take()? });
+            inbox.push(InboxEvent::Cancelled {
+                id: self.active.take()?,
+            });
             return Some(());
         }
-        if name_len == 0 || name_len > MAX_PATH_BYTES || data_len > MAX_INPUT_BYTES || name_len.checked_add(data_len)? != self.input.len() {
+        if name_len == 0
+            || name_len > MAX_PATH_BYTES
+            || data_len > MAX_INPUT_BYTES
+            || name_len.checked_add(data_len)? != input.len()
+        {
             return None;
         }
-        let name = std::str::from_utf8(self.input.get(..name_len)?).ok()?;
+        let name = std::str::from_utf8(input.get(..name_len)?).ok()?;
         if name.contains('\0') {
             return None;
         }
         let name = name.to_owned();
-        self.input.copy_within(name_len.., 0);
-        self.input.truncate(data_len);
+        input.copy_within(name_len.., 0);
+        input.truncate(data_len);
         let id = self.active.take().unwrap_or_else(direct_open);
-        inbox.push(InboxEvent::File(InboxFile { id, name, bytes: std::mem::take(&mut self.input) }));
+        inbox.push(InboxEvent::File(InboxFile {
+            id,
+            name,
+            bytes: input,
+        }));
         Some(())
     }
 }

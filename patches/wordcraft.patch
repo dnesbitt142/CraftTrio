@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 8eae304..36c15eb 100644
+index 8eae304..f71b844 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -1053,12 +1053,10 @@ dependencies = [
@@ -15,7 +15,18 @@ index 8eae304..36c15eb 100644
  dependencies = [
   "fixed_decimal",
   "icu_decimal",
-@@ -1114,7 +1112,6 @@ dependencies = [
+@@ -1078,6 +1076,10 @@ dependencies = [
+  "writeable",
+ ]
+ 
++[[package]]
++name = "craft-memory"
++version = "0.1.0"
++
+ [[package]]
+ name = "craft-pdf"
+ version = "0.1.0"
+@@ -1114,7 +1116,6 @@ dependencies = [
  [[package]]
  name = "craft-ui"
  version = "0.1.0"
@@ -23,7 +34,15 @@ index 8eae304..36c15eb 100644
  dependencies = [
   "craft-fonts-build",
   "craft-i18n",
-@@ -7037,6 +7034,16 @@ dependencies = [
+@@ -2927,7 +2928,6 @@ dependencies = [
+ [[package]]
+ name = "krilla"
+ version = "0.8.2"
+-source = "git+https://github.com/storytold/craft-libs?rev=92d392cff132eaf53e13afff77f38b5c11b73aa0#92d392cff132eaf53e13afff77f38b5c11b73aa0"
+ dependencies = [
+  "base64 0.22.1",
+  "bumpalo",
+@@ -7037,6 +7037,17 @@ dependencies = [
   "zip 3.0.0",
  ]
  
@@ -31,6 +50,7 @@ index 8eae304..36c15eb 100644
 +name = "wordcraft-warp"
 +version = "0.14.0"
 +dependencies = [
++ "craft-memory",
 + "egui",
 + "wordcraft-doc",
 + "wordcraft-engine",
@@ -41,9 +61,18 @@ index 8eae304..36c15eb 100644
  name = "wordcraft-web"
  version = "0.14.0"
 diff --git a/Cargo.toml b/Cargo.toml
-index 7fce587..1ff5c50 100644
+index 7fce587..f9d9574 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
+@@ -132,7 +132,7 @@ debug = 0
+ 
+ # Required by craft-pdf: the backend rejects writers that failed during unwinding.
+ [patch.crates-io]
+-krilla = { git = "https://github.com/storytold/craft-libs", rev = "92d392cff132eaf53e13afff77f38b5c11b73aa0" }
++krilla = { path = "../gui-craft-libs/vendor/krilla" }
+ ecolor = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+ emath = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+ epaint = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
 @@ -148,3 +148,8 @@ eframe = { git = "https://github.com/storytold/egui.git", rev = "6d518fc79968157
  egui_demo_lib = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
  egui_inspection = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
@@ -55,10 +84,10 @@ index 7fce587..1ff5c50 100644
 +craft-i18n = { path = "../gui-craft-libs/crates/i18n" }
 diff --git a/apps/wordcraft-warp/Cargo.toml b/apps/wordcraft-warp/Cargo.toml
 new file mode 100644
-index 0000000..206f3eb
+index 0000000..5b7a9cd
 --- /dev/null
 +++ b/apps/wordcraft-warp/Cargo.toml
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,18 @@
 +[package]
 +name = "wordcraft-warp"
 +version.workspace = true
@@ -72,6 +101,7 @@ index 0000000..206f3eb
 +crate-type = ["cdylib"]
 +
 +[dependencies]
++craft-memory = { path = "../../../native/rust-memory" }
 +wordcraft-doc = { workspace = true }
 +wordcraft-engine = { workspace = true }
 +wordcraft-ui-egui = { workspace = true }
@@ -425,10 +455,10 @@ index 0000000..339e772
 +}
 diff --git a/apps/wordcraft-warp/src/file_bridge.rs b/apps/wordcraft-warp/src/file_bridge.rs
 new file mode 100644
-index 0000000..9a2b395
+index 0000000..350e85f
 --- /dev/null
 +++ b/apps/wordcraft-warp/src/file_bridge.rs
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,111 @@
 +//! File selection and byte delivery for the Presentation Manager host.
 +use std::cell::{Cell, RefCell};
 +use std::rc::Rc;
@@ -507,54 +537,63 @@ index 0000000..9a2b395
 +        self.request.replace(0)
 +    }
 +
++    pub(crate) fn input_capacity(&self) -> usize {
++        self.input.capacity()
++    }
++
 +    pub(crate) fn reserve_input(&mut self, len: usize) -> Option<usize> {
-+        if len == 0 || len > MAX_INPUT_BYTES {
-+            return None;
-+        }
-+        self.input.clear();
-+        self.input.try_reserve_exact(len).ok()?;
-+        self.input.resize(len, 0);
-+        Some(self.input.as_mut_ptr() as usize)
++        craft_memory::buffers::reserve_input(&mut self.input, len, MAX_INPUT_BYTES + MAX_PATH_BYTES)
 +    }
 +
 +    pub(crate) fn accept_input(&mut self, name_len: usize, data_len: usize) -> Option<()> {
-+        if name_len == 0 || name_len > MAX_PATH_BYTES || name_len.checked_add(data_len)? != self.input.len() {
++        // The host is done with this pointer. Dropping a rejected/cancelled
++        // request releases its storage; successful input moves into the inbox.
++        let mut input = std::mem::take(&mut self.input);
++        if name_len == 0 && data_len == 0 {
++            return Some(());
++        }
++        if name_len == 0 || name_len > MAX_PATH_BYTES || data_len > MAX_INPUT_BYTES || name_len.checked_add(data_len)? != input.len() {
 +            return None;
 +        }
 +        let mut inbox = self.inbox.lock().ok()?;
 +        if !inbox.is_empty() {
 +            return None;
 +        }
-+        let name = std::str::from_utf8(self.input.get(..name_len)?).ok()?;
++        let name = std::str::from_utf8(input.get(..name_len)?).ok()?;
 +        if name.contains('\0') {
 +            return None;
 +        }
 +        let name = name.to_owned();
-+        self.input.copy_within(name_len.., 0);
-+        self.input.truncate(data_len);
-+        inbox.push((name, std::mem::take(&mut self.input)));
++        input.copy_within(name_len.., 0);
++        input.truncate(data_len);
++        inbox.push((name, input));
 +        Some(())
 +    }
 +}
 diff --git a/apps/wordcraft-warp/src/lib.rs b/apps/wordcraft-warp/src/lib.rs
 new file mode 100644
-index 0000000..c44be35
+index 0000000..50b389f
 --- /dev/null
 +++ b/apps/wordcraft-warp/src/lib.rs
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,18 @@
 +//! Host bridge for the upstream WordCraft UI on WASI Preview 1.
-+#[cfg(target_os = "wasi")]
-+mod network;
 +#[cfg(target_os = "wasi")]
 +mod a11y;
 +#[cfg(target_os = "wasi")]
++mod clipboard;
++#[cfg(target_os = "wasi")]
 +mod file_bridge;
++#[cfg(target_os = "wasi")]
++mod network;
 +#[cfg(target_os = "wasi")]
 +mod print_bridge;
 +#[cfg(target_os = "wasi")]
-+mod clipboard;
-+#[cfg(target_os = "wasi")]
 +mod wasi;
++
++// The allocator keeps its page ledger outside reclaimed user allocations.
++#[cfg(target_os = "wasi")]
++#[global_allocator]
++static OS2_ALLOCATOR: craft_memory::ReclaimAllocator = craft_memory::ReclaimAllocator::new();
 diff --git a/apps/wordcraft-warp/src/network.rs b/apps/wordcraft-warp/src/network.rs
 new file mode 100644
 index 0000000..c5026a5
@@ -804,10 +843,10 @@ index 0000000..c768f1e
 +}
 diff --git a/apps/wordcraft-warp/src/wasi.rs b/apps/wordcraft-warp/src/wasi.rs
 new file mode 100644
-index 0000000..c95f866
+index 0000000..25602eb
 --- /dev/null
 +++ b/apps/wordcraft-warp/src/wasi.rs
-@@ -0,0 +1,398 @@
+@@ -0,0 +1,423 @@
 +use egui::epaint::{ClippedPrimitive, ImageData, Primitive};
 +use egui::{Context, Event, Key, Modifiers, PointerButton, RawInput, Rect, TextureId};
 +use std::cell::RefCell;
@@ -835,6 +874,7 @@ index 0000000..c95f866
 +    elapsed_ms: u64,
 +    repaint_delay_ms: u32,
 +    draw: Vec<u8>,
++    draw_keep_bytes: usize,
 +    accessibility: Accessibility,
 +}
 +
@@ -861,7 +901,7 @@ index 0000000..c95f866
 +            return 0;
 +        }
 +        let files = Files::default();
-+        let mut session = Session::new(wordcraft_engine::sample::sample_document());
++        let mut session = Session::new(wordcraft_doc::Document::new());
 +        session.system_region = wordcraft_ui_egui::i18n::system_region();
 +        let mut services = files.services();
 +        crate::clipboard::install(&mut services);
@@ -882,6 +922,7 @@ index 0000000..c95f866
 +            elapsed_ms: 0,
 +            repaint_delay_ms: u32::MAX,
 +            draw: Vec::new(),
++            draw_keep_bytes: 0,
 +            accessibility: Accessibility::default(),
 +        });
 +        0
@@ -1039,9 +1080,7 @@ index 0000000..c95f866
 +        state.repaint_delay_ms = if scale != previous_scale {
 +            0
 +        } else {
-+            frame.viewport_output.get(&egui::ViewportId::ROOT)
-+                .and_then(|root| u32::try_from(root.repaint_delay.as_millis()).ok())
-+                .unwrap_or(u32::MAX)
++            frame.viewport_output.get(&egui::ViewportId::ROOT).and_then(|root| u32::try_from(root.repaint_delay.as_millis()).ok()).unwrap_or(u32::MAX)
 +        };
 +        let primitives = ctx.tessellate(frame.shapes, frame.pixels_per_point);
 +        let mut textures = frame.textures_delta;
@@ -1049,7 +1088,8 @@ index 0000000..c95f866
 +        let packed = pack_draw(&mut state.draw, &textures, &primitives, screen_pixels, scale);
 +        // The PM host receives every delta in the draw packet and owns its application.
 +        textures.clear();
-+        if packed.is_some() {
++        if let Some(keep_bytes) = packed {
++            state.draw_keep_bytes = keep_bytes;
 +            0
 +        } else {
 +            eprintln!("WordCraft's frame exceeded the Presentation Manager bridge limits.");
@@ -1113,6 +1153,28 @@ index 0000000..c95f866
 +    with_app(|state| state.draw.len()).unwrap_or(0)
 +}
 +
++/// Called only after the native renderer has consumed this frame. Texture
++/// uploads are one-shot: retain the mesh-sized budget, not the upload peak.
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_draw_consumed() -> i32 {
++    with_app(|state| {
++        craft_memory::buffers::consume_draw(&mut state.draw, state.draw_keep_bytes);
++        0
++    })
++    .unwrap_or(1)
++}
++
++/// Diagnostic capacities only: neither query changes packet storage or pointers.
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_draw_capacity() -> usize {
++    with_app(|state| state.draw.capacity()).unwrap_or(0)
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn wc_input_capacity() -> usize {
++    with_app(|state| state.files.input_capacity()).unwrap_or(0)
++}
++
 +/// The current native accessibility snapshot remains valid until the next frame.
 +#[unsafe(no_mangle)]
 +pub extern "C" fn wc_a11y_ptr() -> usize {
@@ -1139,7 +1201,7 @@ index 0000000..c95f866
 +    out.extend_from_slice(&value.to_le_bytes());
 +}
 +
-+fn pack_draw(out: &mut Vec<u8>, textures: &egui::TexturesDelta, primitives: &[ClippedPrimitive], screen: Rect, scale: f32) -> Option<()> {
++fn pack_draw(out: &mut Vec<u8>, textures: &egui::TexturesDelta, primitives: &[ClippedPrimitive], screen: Rect, scale: f32) -> Option<usize> {
 +    let pixels = |pos: egui::Pos2| (pos.to_vec2() * scale).to_pos2();
 +    let meshes = || {
 +        primitives.iter().filter_map(|item| {
@@ -1150,11 +1212,14 @@ index 0000000..c95f866
 +    };
 +    let updates = || textures.set.iter().flat_map(|(id, deltas)| deltas.iter().map(move |delta| (*id, delta)));
 +    let mut bytes = 16usize.checked_add(textures.free.len().checked_mul(4)?)?;
++    let mut texture_bytes = 0usize;
 +    let mut set_count = 0u32;
 +    for (_, delta) in updates() {
 +        set_count = set_count.checked_add(1)?;
 +        let ImageData::Color(image) = &delta.image;
-+        bytes = bytes.checked_add(20usize.checked_add(image.pixels.len().checked_mul(4)?)?)?;
++        let upload_bytes = 20usize.checked_add(image.pixels.len().checked_mul(4)?)?;
++        bytes = bytes.checked_add(upload_bytes)?;
++        texture_bytes = texture_bytes.checked_add(upload_bytes)?;
 +    }
 +    let mut mesh_count = 0u32;
 +    for (mesh, _) in meshes() {
@@ -1164,8 +1229,7 @@ index 0000000..c95f866
 +    if bytes > MAX_PACKET {
 +        return None;
 +    }
-+    out.clear();
-+    out.try_reserve(bytes).ok()?;
++    craft_memory::buffers::prepare_draw(out, bytes)?;
 +    out.extend_from_slice(b"WCG1");
 +    put_u32(out, set_count);
 +    put_u32(out, mesh_count);
@@ -1204,7 +1268,7 @@ index 0000000..c95f866
 +    for id in &textures.free {
 +        put_u32(out, texture_number(*id)?);
 +    }
-+    Some(())
++    bytes.checked_sub(texture_bytes)
 +}
 diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
 index 76f5392..1855482 100644

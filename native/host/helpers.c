@@ -3,6 +3,21 @@
 
 #include "ow-ieee-round.h"
 
+/* GCC emits these classifiers when wasm2c is built with -fsignaling-nans. */
+int __isnan(double value)
+{
+    union { double value; uint64_t bits; } number;
+    number.value = value;
+    return (number.bits & UINT64_C(0x7fffffffffffffff)) > UINT64_C(0x7ff0000000000000);
+}
+
+int __isnanf(float value)
+{
+    union { float value; uint32_t bits; } number;
+    number.value = value;
+    return (number.bits & UINT32_C(0x7fffffff)) > UINT32_C(0x7f800000);
+}
+
 int __clzdi2(uint64_t value)
 {
     uint32_t upper = (uint32_t)(value >> 32);

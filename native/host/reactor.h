@@ -7,8 +7,14 @@
 typedef enum WcOperation {
     WCR_INIT, WCR_FRAME, WCR_EVENT, WCR_TEXT, WCR_DRAW_PTR, WCR_DRAW_LEN,
     WCR_OPEN_REQUESTED, WCR_RESERVE_INPUT, WCR_ACCEPT_INPUT, WCR_CLOSE_REQUEST,
-    WCR_SHOULD_CLOSE, WCR_A11Y_PTR, WCR_A11Y_LEN, WCR_REPAINT_DELAY
+    WCR_SHOULD_CLOSE, WCR_A11Y_PTR, WCR_A11Y_LEN, WCR_REPAINT_DELAY,
+    WCR_CAPABILITIES, WCR_DRAW_CONSUMED,
+    WCR_MEMORY_COMMITTED, WCR_MEMORY_RECLAIMED
 } WcOperation;
+
+/* Optional operations appended after the original ABI1 operation numbers. */
+#define WC_ENGINE_DRAW_CONSUMED 1U
+#define WC_ENGINE_MEMORY_STATS 2U
 
 /* The engine is linked into the executable. Calls run on the PM thread. */
 const char *wc_reactor_start(void);
